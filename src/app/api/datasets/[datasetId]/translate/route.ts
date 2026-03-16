@@ -67,7 +67,7 @@ ${JSON.stringify(payload)}`
 
                 try {
                     const response = await ai.models.generateContent({
-                        model: 'gemini-3.1-flash-lite',
+                        model: 'gemini-3.1-flash-lite-preview',
                         contents: prompt,
                         config: {
                             responseMimeType: 'application/json',
