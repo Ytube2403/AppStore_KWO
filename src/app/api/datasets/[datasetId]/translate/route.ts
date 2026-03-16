@@ -34,28 +34,28 @@ export async function POST(request: Request, { params }: { params: Promise<{ dat
             return NextResponse.json({ success: true, updatedCount: 0 })
         }
 
-        const updates: { id: string, dataset_id: string, keyword_en: string }[] = []
-        const errors: { error: string, keyword?: string }[] = []
+        const updates: { id: string, keyword_en: string }[] = []
+        const errors: { error: string }[] = []
 
         // Initialize Gemini Client
         const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
 
-        // 1. Tăng chunkSize lên 200 (Flash xử lý JSON rất tốt và keyword ngắn)
-        const chunkSize = 200;
+        // gemini-3.1-flash-lite: RPM=35 (highest in account) → can push more concurrency
+        // RPM=35 ÷ 7 concurrent = ~5 batches/min with 1200ms buffer between groups
+        const chunkSize = 200
+        const concurrencyLimit = 7    // safe for RPM=35
+        const interBatchDelay = 1200  // buffer between batch groups
 
-        // 2. Chạy song song (Concurrency = 3) để tối ưu tốc độ mà không dính rate limit (15 req/min)
-        const concurrencyLimit = 3;
-
-        const chunks = [];
+        const chunks: typeof keywordsToTranslate[] = []
         for (let i = 0; i < keywordsToTranslate.length; i += chunkSize) {
-            chunks.push(keywordsToTranslate.slice(i, i + chunkSize));
+            chunks.push(keywordsToTranslate.slice(i, i + chunkSize))
         }
 
         for (let i = 0; i < chunks.length; i += concurrencyLimit) {
-            const batchChunks = chunks.slice(i, i + concurrencyLimit);
+            const batchChunks = chunks.slice(i, i + concurrencyLimit)
 
-            const promises = batchChunks.map(async (chunk, chunkIndex) => {
-                const payload = chunk.map(kw => ({ id: kw.id, keyword: kw.keyword }));
+            const promises = batchChunks.map(async (chunk) => {
+                const payload = chunk.map(kw => ({ id: kw.id, keyword: kw.keyword }))
 
                 const prompt = `You are an expert translator specializing in App Store Optimization (ASO) for mobile apps and games. 
 Translate the following keywords into English. 
@@ -63,59 +63,60 @@ Return ONLY a valid JSON object matching this schema:
 { "translations": [ { "id": "string", "keyword_en": "string" } ] }
 
 Input Keywords:
-${JSON.stringify(payload)}`;
+${JSON.stringify(payload)}`
 
                 try {
                     const response = await ai.models.generateContent({
-                        model: 'gemini-2.5-flash',
+                        model: 'gemini-3.1-flash-lite',
                         contents: prompt,
                         config: {
-                            responseMimeType: "application/json",
+                            responseMimeType: 'application/json',
                             temperature: 0.1,
                         }
-                    });
+                    })
 
                     if (response.text) {
-                        const parsed = JSON.parse(response.text);
+                        const parsed = JSON.parse(response.text)
                         if (parsed && Array.isArray(parsed.translations)) {
                             for (const item of parsed.translations) {
                                 if (item.id && item.keyword_en) {
-                                    updates.push({
-                                        id: item.id,
-                                        dataset_id: datasetId,
-                                        keyword_en: item.keyword_en
-                                    });
+                                    updates.push({ id: item.id, keyword_en: item.keyword_en })
                                 }
                             }
                         }
                     }
                 } catch (translationErr: any) {
-                    console.error(`Failed to translate chunk`, translationErr);
-                    errors.push({ error: translationErr.message || 'Gemini API translation failed for a chunk' });
+                    console.error(`Failed to translate chunk`, translationErr)
+                    errors.push({ error: translationErr.message || 'Gemini API translation failed for a chunk' })
                 }
-            });
+            })
 
-            await Promise.all(promises);
+            await Promise.all(promises)
 
-            // Delay giữa các đợt 3 concurrent requests để tránh lỗi 429 Too many requests
             if (i + concurrencyLimit < chunks.length) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                await new Promise(resolve => setTimeout(resolve, interBatchDelay))
             }
         }
 
+        // Optimization 2: Parallel DB writes instead of sequential loop
+        // Before: for (const u of updates) { await supabase.update(...) } — O(n) round trips
+        // After:  Promise.all fires all concurrently → ~same time as 1 single request
         if (updates.length > 0) {
-            // Use update instead of upsert to perform partial updates and avoid violating NOT NULL constraints on other columns like 'keyword'
-            for (const update of updates) {
-                const { error: updateError } = await supabase
-                    .from('keywords')
-                    .update({ keyword_en: update.keyword_en })
-                    .eq('id', update.id)
-
-                if (updateError) throw updateError
-            }
+            await Promise.all(
+                updates.map(update =>
+                    supabase
+                        .from('keywords')
+                        .update({ keyword_en: update.keyword_en })
+                        .eq('id', update.id)
+                )
+            )
         }
 
-        return NextResponse.json({ success: true, updatedCount: updates.length, errors: errors.length > 0 ? errors : undefined })
+        return NextResponse.json({
+            success: true,
+            updatedCount: updates.length,
+            errors: errors.length > 0 ? errors : undefined
+        })
     } catch (error: any) {
         return NextResponse.json({ error: error.message }, { status: 500 })
     }
