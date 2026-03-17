@@ -95,7 +95,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ dat
 
         keywords.forEach(k => {
             const currentVolume = k.volume || 0
-            const maxVolume = k.max_volume !== null && k.max_volume !== undefined ? k.max_volume : currentVolume
+            const maxVolume = k.max_volume ? k.max_volume : currentVolume
 
             // 70% max_volume + 30% current_volume
             const effectiveVolume = (0.70 * maxVolume) + (0.30 * currentVolume)
@@ -126,8 +126,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ dat
             let is_qualified = true
 
             // Global Vol/Diff bounds
+            const effectiveMaxVol = k.max_volume ? k.max_volume : (k.volume || 0)
             if (filters.minVolume && (k.volume === null || k.volume < parseFloat(filters.minVolume))) is_qualified = false
-            if (filters.minMaxVolume && (k.max_volume === null || k.max_volume === undefined || k.max_volume < parseFloat(filters.minMaxVolume))) is_qualified = false
+            if (filters.minMaxVolume && (effectiveMaxVol < parseFloat(filters.minMaxVolume))) is_qualified = false
             if (filters.maxDifficulty && (k.difficulty !== null && k.difficulty > parseFloat(filters.maxDifficulty))) is_qualified = false
             if (filters.minMyRank && (k.my_rank === null || k.my_rank > parseFloat(filters.minMyRank))) is_qualified = false
 
@@ -193,7 +194,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ dat
 
             // --- 0. Chuẩn hoá dữ liệu (Normalization Tools) ---
             const currentVolume = k.volume || 0
-            const maxVolume = k.max_volume !== null && k.max_volume !== undefined ? k.max_volume : currentVolume
+            const maxVolume = k.max_volume ? k.max_volume : currentVolume
             const effectiveVolume = (0.70 * maxVolume) + (0.30 * currentVolume)
 
             const rawVol = useLogVolume && effectiveVolume > 0 ? Math.log10(effectiveVolume + 1) : effectiveVolume

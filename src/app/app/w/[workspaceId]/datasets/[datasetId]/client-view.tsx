@@ -17,7 +17,7 @@ import {
 } from '@tanstack/react-table'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import React from 'react'
-import { Download, Edit2, Check, X, Loader2, ChevronDown, Filter, Sparkles, HelpCircle } from 'lucide-react'
+import { Download, Edit2, Check, X, Loader2, ChevronDown, Filter, Sparkles, HelpCircle, Globe, PlayCircle, AlertTriangle, BarChart2 } from 'lucide-react'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
@@ -77,6 +77,9 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
     const [isExporting, setIsExporting] = useState(false)
     const [isTranslating, setIsTranslating] = useState(false)
     const [isCollapsed, setIsCollapsed] = useState(false)
+    // Job polling state (for async Worker translation)
+    const [activeJobId, setActiveJobId] = useState<string | null>(null)
+    const [jobProgress, setJobProgress] = useState(0)
 
     // Preset Config State changes
     const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
@@ -89,12 +92,22 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
     const [datasetName, setDatasetName] = useState(dataset.name)
     const [datasetMarket, setDatasetMarket] = useState(dataset.market)
     const [datasetConcept, setDatasetConcept] = useState(dataset.concept)
+    const [datasetTargetAppUrl, setDatasetTargetAppUrl] = useState<string>(dataset.target_app_url || '')
+    const [datasetTargetAppProfile, setDatasetTargetAppProfile] = useState<any>(dataset.target_app_profile || null)
 
     const [isEditingSettings, setIsEditingSettings] = useState(false)
     const [newName, setNewName] = useState(dataset.name)
     const [newMarket, setNewMarket] = useState(dataset.market || '')
     const [newConcept, setNewConcept] = useState(dataset.concept || '')
+    const [newTargetAppUrl, setNewTargetAppUrl] = useState<string>(dataset.target_app_url || '')
     const [isSavingSettings, setIsSavingSettings] = useState(false)
+
+    // Tab 2 — Intent & Clusters state
+    const [activeTab, setActiveTab] = useState<'keywords' | 'intent'>('keywords')
+    const [isGeneratingProfile, setIsGeneratingProfile] = useState(false)
+    const [isStartingAnalysis, setIsStartingAnalysis] = useState(false)
+    const [analysisRunId, setAnalysisRunId] = useState<string | null>(null)
+    const [analysisProgress, setAnalysisProgress] = useState(0)
 
     // Basic Filter States
     const [minVolume, setMinVolume] = useState('')
@@ -247,7 +260,9 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
             size: 100,
             cell: (info) => {
                 const val = info.getValue() as number | null
-                return val !== null && val !== undefined ? <span className="text-gray-500">{val}</span> : <span className="text-gray-300">-</span>
+                const originalVol = info.row.original.volume ?? 0
+                const effectiveVol = !val || val === 0 ? originalVol : val
+                return <span className={!val || val === 0 ? "text-gray-400" : "text-gray-500"}>{effectiveVol}</span>
             }
         },
         {
@@ -286,7 +301,8 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
         return data.filter((row, index) => {
             if (minVolume && (row.volume === null || row.volume < parseFloat(minVolume))) return false
             // minMaxVolume: passes if max_volume >= threshold (OR if max_volume is null, let it pass)
-            if (minMaxVolume && (row.max_volume === null || row.max_volume === undefined || row.max_volume < parseFloat(minMaxVolume))) return false
+            const effectiveMaxVol = !row.max_volume || row.max_volume === 0 ? (row.volume ?? 0) : row.max_volume
+            if (minMaxVolume && (effectiveMaxVol < parseFloat(minMaxVolume))) return false
             if (maxDifficulty && (row.difficulty !== null && row.difficulty > parseFloat(maxDifficulty))) return false
             if (minMyRank && (row.my_rank === null || row.my_rank > parseFloat(minMyRank))) return false
             if (hideDisqualified && row.is_qualified === false) return false
@@ -353,14 +369,22 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                 body: JSON.stringify({
                     name: newName,
                     market: newMarket,
-                    concept: newConcept
+                    concept: newConcept,
+                    target_app_url: newTargetAppUrl,
                 })
             })
-            if (!res.ok) throw new Error('Failed to update dataset settings')
-            const data = await res.json()
-            setDatasetName(data.name)
-            setDatasetMarket(data.market)
-            setDatasetConcept(data.concept)
+            if (!res.ok) {
+                const errJson = await res.json().catch(() => ({}))
+                throw new Error(errJson.error || 'Failed to update dataset settings')
+            }
+            const savedData = await res.json()
+            setDatasetName(savedData.name)
+            setDatasetMarket(savedData.market)
+            setDatasetConcept(savedData.concept)
+            if (newTargetAppUrl !== datasetTargetAppUrl) {
+                setDatasetTargetAppUrl(newTargetAppUrl)
+                setDatasetTargetAppProfile(null)  // cleared on URL change
+            }
             setIsEditingSettings(false)
             toast.success('Dataset updated')
         } catch (e: any) {
@@ -387,7 +411,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                 Keyword: row.keyword,
                 'English Translation': row.keyword_en || '',
                 Volume: row.volume,
-                'Max Volume': row.max_volume ?? '',
+                'Max Volume': (!row.max_volume || row.max_volume === 0) ? (row.volume ?? '') : row.max_volume,
                 Difficulty: row.difficulty,
                 KEI: row.kei,
                 'My Rank': row.my_rank,
@@ -475,8 +499,6 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                 return
             }
 
-            toast.info(`Translating ${keysToTranslate.length} keywords... this may take a moment.`)
-
             const res = await fetch(`/api/datasets/${dataset.id}/translate`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -486,6 +508,16 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
             const result = await res.json()
             if (!res.ok) throw new Error(result.error || 'Translation failed')
 
+            // ── Async Worker path (USE_WORKER_TRANSLATION=true) ──────────────
+            if (result.async && result.jobId) {
+                setActiveJobId(result.jobId)
+                setJobProgress(0)
+                toast.info(`Translating ${keysToTranslate.length} keywords in background...`)
+                // Don't setIsTranslating(false) yet — button stays disabled while job runs
+                return
+            }
+
+            // ── Synchronous path (USE_WORKER_TRANSLATION=false, default) ────
             if (result.errors && result.errors.length > 0) {
                 console.warn("Some translations failed:", result.errors)
                 toast.warning(`Translated ${result.updatedCount} keywords. ${result.errors.length} failed (Check console).`)
@@ -500,6 +532,50 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
             setIsTranslating(false)
         }
     }
+
+    // ── Job polling useEffect — polls Supabase directly on the client ─────────
+    useEffect(() => {
+        if (!activeJobId) return
+
+        const interval = setInterval(async () => {
+            try {
+                const { data: job, error } = await supabase
+                    .from('analysis_jobs')
+                    .select('status, progress_percent, error_message, completed_at')
+                    .eq('id', activeJobId)
+                    .single()
+
+                if (error || !job) return
+
+                setJobProgress(job.progress_percent ?? 0)
+
+                if (job.status === 'completed') {
+                    clearInterval(interval)
+                    setActiveJobId(null)
+                    setJobProgress(0)
+                    setIsTranslating(false)
+                    loadData()
+                    toast.success('Translation complete! Keywords updated.')
+                } else if (job.status === 'failed') {
+                    clearInterval(interval)
+                    setActiveJobId(null)
+                    setJobProgress(0)
+                    setIsTranslating(false)
+                    toast.error(`Translation failed: ${job.error_message || 'Unknown error'}`)
+                } else if (job.status === 'cancelled') {
+                    clearInterval(interval)
+                    setActiveJobId(null)
+                    setJobProgress(0)
+                    setIsTranslating(false)
+                    toast.info('Translation was cancelled.')
+                }
+            } catch (err) {
+                console.error('Polling error:', err)
+            }
+        }, 5000)  // poll every 5s
+
+        return () => clearInterval(interval)
+    }, [activeJobId, supabase])
 
     // Virtualizer
     const parentRef = useRef<HTMLDivElement>(null)
@@ -573,6 +649,17 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                                 placeholder="e.g. Brand, Casual, Competitors"
                                                 onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
                                             />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="flex items-center gap-1">
+                                                <Globe className="h-3.5 w-3.5" /> Target App Store URL <span className="text-gray-400 font-normal">(Optional)</span>
+                                            </Label>
+                                            <Input
+                                                value={newTargetAppUrl}
+                                                onChange={e => setNewTargetAppUrl(e.target.value)}
+                                                placeholder="https://apps.apple.com/... or https://play.google.com/..."
+                                            />
+                                            <p className="text-[11px] text-gray-400">Used to generate an AI-powered App Profile for Intent Analysis.</p>
                                         </div>
                                     </div>
                                     <DialogFooter>
@@ -900,6 +987,36 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                     </div>
                 </div>
 
+                {/* Tab Navigation */}
+                <div className="flex border-b bg-white px-4 shrink-0">
+                    <button
+                        className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+                            activeTab === 'keywords'
+                                ? 'border-[#FF8903] text-[#FF8903]'
+                                : 'border-transparent text-gray-500 hover:text-gray-700'
+                        }`}
+                        onClick={() => setActiveTab('keywords')}
+                    >
+                        Keywords
+                    </button>
+                    <button
+                        className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors flex items-center gap-1.5 ${
+                            activeTab === 'intent'
+                                ? 'border-[#FF8903] text-[#FF8903]'
+                                : 'border-transparent text-gray-500 hover:text-gray-700'
+                        }`}
+                        onClick={() => setActiveTab('intent')}
+                    >
+                        <BarChart2 className="h-3.5 w-3.5" />
+                        Intent & Clusters
+                        {datasetTargetAppProfile && (
+                            <span className="ml-1 text-[10px] bg-emerald-100 text-emerald-700 rounded-full px-1.5 py-0.5 font-semibold">AI</span>
+                        )}
+                    </button>
+                </div>
+
+                {activeTab === 'keywords' && (
+                <>
                 {/* Main Table Area */}
                 <div className="flex-1 min-h-0 flex flex-col relative">
 
@@ -1084,7 +1201,236 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                         )}
                     </div>
                 </div>
+                </> )}
+
+                {activeTab === 'intent' && (
+                    <div className="flex-1 min-h-0 flex flex-col items-center justify-center bg-gray-50/40 p-8 gap-6">
+                        {/* State A: No target_app_url set */}
+                        {!datasetTargetAppUrl && (
+                            <div className="max-w-md w-full bg-white rounded-2xl border shadow-sm p-8 flex flex-col items-center text-center gap-4">
+                                <div className="h-14 w-14 rounded-full bg-gray-100 flex items-center justify-center">
+                                    <Globe className="h-7 w-7 text-gray-400" />
+                                </div>
+                                <div>
+                                    <h3 className="font-semibold text-gray-900 text-lg">Add your Target App URL</h3>
+                                    <p className="text-sm text-gray-500 mt-1">
+                                        To run Intent Analysis, link this dataset to an App Store or Google Play page so we can build a Semantic App Profile.
+                                    </p>
+                                </div>
+                                <Button
+                                    size="sm"
+                                    className="gap-2 bg-[#FF8903] hover:bg-[#FEB107] text-white"
+                                    onClick={() => { setNewTargetAppUrl(datasetTargetAppUrl); setIsEditingSettings(true); setActiveTab('keywords') }}
+                                >
+                                    <Edit2 className="h-4 w-4" />
+                                    Open Dataset Settings
+                                </Button>
+                            </div>
+                        )}
+
+                        {/* State B: Has URL but no profile yet (not running) */}
+                        {datasetTargetAppUrl && !datasetTargetAppProfile && !analysisRunId && (
+                            <div className="max-w-lg w-full flex flex-col gap-4">
+                                <div className="bg-white rounded-2xl border shadow-sm p-8 flex flex-col items-center text-center gap-4">
+                                    <div className="h-14 w-14 rounded-full bg-[#FF8903]/10 flex items-center justify-center">
+                                        <Sparkles className="h-7 w-7 text-[#FF8903]" />
+                                    </div>
+                                    <div>
+                                        <h3 className="font-semibold text-gray-900 text-lg">Generate App Profile</h3>
+                                        <p className="text-sm text-gray-500 mt-1">
+                                            We&apos;ll scrape your App Store page and use Gemini AI to build a Semantic Profile — identifying your app&apos;s primary use cases and irrelevant intents.
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-2 font-mono break-all">{datasetTargetAppUrl}</p>
+                                    </div>
+                                    <Button
+                                        size="sm"
+                                        disabled={isGeneratingProfile}
+                                        className="gap-2 bg-[#FF8903] hover:bg-[#FEB107] text-white min-w-[180px]"
+                                        onClick={async () => {
+                                            setIsGeneratingProfile(true)
+                                            try {
+                                                const res = await fetch(`/api/datasets/${dataset.id}/generate-profile`, { method: 'POST' })
+                                                const json = await res.json()
+                                                if (!res.ok) throw new Error(json.error || 'Failed to generate profile')
+                                                setDatasetTargetAppProfile(json.profile)
+                                                toast.success(`Profile generated for ${json.app?.title || 'your app'}!`)
+                                            } catch (e: any) {
+                                                toast.error(e.message)
+                                            } finally {
+                                                setIsGeneratingProfile(false)
+                                            }
+                                        }}
+                                    >
+                                        {isGeneratingProfile ? (
+                                            <><Loader2 className="h-4 w-4 animate-spin" /> Analyzing...</>
+                                        ) : (
+                                            <><Sparkles className="h-4 w-4" /> Generate Profile</>
+                                        )}
+                                    </Button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* State B2: Has profile — show summary card + Start Analysis */}
+                        {datasetTargetAppUrl && datasetTargetAppProfile && !analysisRunId && (
+                            <div className="max-w-lg w-full flex flex-col gap-4">
+                                <div className="bg-white rounded-2xl border shadow-sm p-6 flex flex-col gap-4">
+                                    <div className="flex items-start justify-between gap-4">
+                                        <div>
+                                            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">App Profile</p>
+                                            <h3 className="font-semibold text-gray-900">{datasetTargetAppProfile.title}</h3>
+                                            <p className="text-xs text-gray-500">{datasetTargetAppProfile.category}</p>
+                                        </div>
+                                        <span className="text-[10px] bg-emerald-100 text-emerald-700 rounded-full px-2 py-1 font-semibold shrink-0">AI Profile</span>
+                                    </div>
+                                    {datasetTargetAppProfile.primary_use_cases?.length > 0 && (
+                                        <div>
+                                            <p className="text-xs font-semibold text-gray-500 mb-1.5">Primary Use Cases</p>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {datasetTargetAppProfile.primary_use_cases.map((uc: string) => (
+                                                    <span key={uc} className="text-[11px] bg-blue-50 text-blue-700 border border-blue-100 rounded-full px-2.5 py-0.5">{uc}</span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                    {datasetTargetAppProfile.negative_intents?.length > 0 && (
+                                        <div>
+                                            <p className="text-xs font-semibold text-gray-500 mb-1.5">Excluded Intents</p>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {datasetTargetAppProfile.negative_intents.map((ni: string) => (
+                                                    <span key={ni} className="text-[11px] bg-red-50 text-red-600 border border-red-100 rounded-full px-2.5 py-0.5">{ni}</span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col gap-3">
+                                    <div className="flex items-start gap-3">
+                                        <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                                        <div className="flex-1 text-sm text-amber-800">
+                                            <p className="font-semibold mb-0.5">Cost Estimate</p>
+                                            <p className="text-xs">
+                                                {(() => {
+                                                    const cnt = data.filter(k => (k.base_score ?? 0) >= 60 && (k.volume ?? 0) >= 10 && (k.difficulty ?? 100) <= 70).length
+                                                    return <>{cnt} keywords eligible for SERP analysis.{cnt > 500 && <span className="font-bold text-amber-900"> (capped at 500)</span>}</>
+                                                })()}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <Button
+                                            size="sm"
+                                            disabled={isStartingAnalysis || data.length === 0}
+                                            className="flex-1 bg-[#FF8903] hover:bg-[#FEB107] text-white gap-2"
+                                            onClick={async () => {
+                                                const eligible = data
+                                                    .filter(k => (k.base_score ?? 0) >= 60 && (k.volume ?? 0) >= 10 && (k.difficulty ?? 100) <= 70)
+                                                    .map((k: any) => k.id)
+                                                    .slice(0, 500)
+                                                if (eligible.length === 0) return toast.error('No eligible keywords found. Adjust your filters.')
+                                                setIsStartingAnalysis(true)
+                                                try {
+                                                    const res = await fetch(`/api/datasets/${dataset.id}/analyze`, {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify({ keywordIds: eligible })
+                                                    })
+                                                    const json = await res.json()
+                                                    if (!res.ok) throw new Error(json.error || 'Failed to start analysis')
+                                                    setAnalysisRunId(json.runId)
+                                                    setAnalysisProgress(0)
+                                                    toast.success(`Analysis started — ${eligible.length} keywords queued`)
+                                                } catch (e: any) {
+                                                    toast.error(e.message)
+                                                } finally {
+                                                    setIsStartingAnalysis(false)
+                                                }
+                                            }}
+                                        >
+                                            {isStartingAnalysis
+                                                ? <><Loader2 className="h-4 w-4 animate-spin" /> Starting...</>
+                                                : <><PlayCircle className="h-4 w-4" /> Start Analysis</>}
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            className="gap-2"
+                                            onClick={() => { setNewTargetAppUrl(datasetTargetAppUrl); setIsEditingSettings(true); setActiveTab('keywords') }}
+                                        >
+                                            <Globe className="h-4 w-4" /> Change URL
+                                        </Button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* State C: Analysis job running */}
+                        {analysisRunId && (
+                            <div className="max-w-md w-full bg-white rounded-2xl border shadow-sm p-8 flex flex-col items-center text-center gap-6">
+                                <div className="h-14 w-14 rounded-full bg-[#FF8903]/10 flex items-center justify-center">
+                                    <Loader2 className="h-7 w-7 text-[#FF8903] animate-spin" />
+                                </div>
+                                <div>
+                                    <h3 className="font-semibold text-gray-900 text-lg">Fetching SERP data…</h3>
+                                    <p className="text-sm text-gray-500 mt-1">
+                                        The Worker is fetching search results for your keywords. This may take a few minutes.
+                                    </p>
+                                </div>
+                                <div className="w-full">
+                                    <div className="flex justify-between text-xs text-gray-400 mb-1.5">
+                                        <span>Progress</span>
+                                        <span>{analysisProgress}%</span>
+                                    </div>
+                                    <div className="h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+                                        <div
+                                            className="h-full rounded-full bg-[#FF8903] transition-all duration-500"
+                                            style={{ width: `${analysisProgress}%` }}
+                                        />
+                                    </div>
+                                </div>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => { setAnalysisRunId(null); setAnalysisProgress(0) }}
+                                >
+                                    Cancel
+                                </Button>
+                            </div>
+                        )}
+                    </div>
+                )}
+
             </div>
+
+            {/* Floating Progress Toast — shown while async translation job is running */}
+            {activeJobId && (
+                <div
+                    className="fixed bottom-5 right-5 z-50 w-72 rounded-2xl border border-orange-200 bg-white shadow-xl"
+                    role="status"
+                    aria-live="polite"
+                    aria-label="Translation progress"
+                >
+                    <div className="p-4">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-orange-50">
+                                <Loader2 className="h-4 w-4 animate-spin text-orange-500" />
+                            </div>
+                            <div>
+                                <p className="text-sm font-semibold text-gray-900">Translating keywords</p>
+                                <p className="text-xs text-gray-500">{jobProgress}% complete</p>
+                            </div>
+                        </div>
+                        <div className="h-1.5 w-full rounded-full bg-orange-100 overflow-hidden">
+                            <div
+                                className="h-full rounded-full bg-orange-500 transition-all duration-500 ease-out"
+                                style={{ width: `${jobProgress}%` }}
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
         </>
     )
 }
+

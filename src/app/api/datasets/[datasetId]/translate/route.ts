@@ -16,6 +16,55 @@ export async function POST(request: Request, { params }: { params: Promise<{ dat
         const { datasetId } = await params
         const { keywordIds } = await request.json()
 
+        // ── Feature Flag: USE_WORKER_TRANSLATION ─────────────────────────────
+        // Set USE_WORKER_TRANSLATION=true in .env.local to route translation
+        // through the background Worker (dùng OpenRouter) thay vì chạy sync ở đây.
+        // Default là false — Gemini sync path chạy như cũ.
+        if (process.env.USE_WORKER_TRANSLATION === 'true') {
+            if (!datasetId || !keywordIds || !Array.isArray(keywordIds) || keywordIds.length === 0) {
+                return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
+            }
+
+            const { data: dataset, error: dsErr } = await supabase
+                .from('datasets')
+                .select('workspace_id')
+                .eq('id', datasetId)
+                .single()
+
+            if (dsErr || !dataset) {
+                return NextResponse.json({ error: 'Dataset not found' }, { status: 404 })
+            }
+
+            const { data: job, error: jobErr } = await supabase
+                .from('analysis_jobs')
+                .insert({
+                    workspace_id: dataset.workspace_id,
+                    dataset_id: datasetId,
+                    job_type: 'translation',
+                    status: 'pending',
+                    priority: 5,
+                    payload: { keyword_ids: keywordIds },
+                    progress_percent: 0,
+                    processed_count: 0,
+                    total_count: keywordIds.length,
+                })
+                .select('id, status, created_at')
+                .single()
+
+            if (jobErr || !job) {
+                console.error('Failed to enqueue translation job:', jobErr)
+                return NextResponse.json({ error: 'Failed to enqueue translation job' }, { status: 500 })
+            }
+
+            return NextResponse.json({
+                async: true,
+                jobId: job.id,
+                status: job.status,
+                message: `Translation job queued. Poll /api/jobs/${job.id} for status.`,
+            })
+        }
+        // ── End Feature Flag ─────────────────────────────────────────────────
+
         if (!datasetId || !keywordIds || !Array.isArray(keywordIds) || keywordIds.length === 0) {
             return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
         }
@@ -40,11 +89,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ dat
         // Initialize Gemini Client
         const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
 
-        // gemini-3.1-flash-lite: RPM=35 (highest in account) → can push more concurrency
-        // RPM=35 ÷ 7 concurrent = ~5 batches/min with 1200ms buffer between groups
+        // gemini-3.1-flash-lite: RPM=35 → concurrency 7, delay 1200ms
         const chunkSize = 200
-        const concurrencyLimit = 7    // safe for RPM=35
-        const interBatchDelay = 1200  // buffer between batch groups
+        const concurrencyLimit = 7
+        const interBatchDelay = 1200
 
         const chunks: typeof keywordsToTranslate[] = []
         for (let i = 0; i < keywordsToTranslate.length; i += chunkSize) {
@@ -98,9 +146,7 @@ ${JSON.stringify(payload)}`
             }
         }
 
-        // Optimization 2: Parallel DB writes instead of sequential loop
-        // Before: for (const u of updates) { await supabase.update(...) } — O(n) round trips
-        // After:  Promise.all fires all concurrently → ~same time as 1 single request
+        // Parallel DB writes
         if (updates.length > 0) {
             await Promise.all(
                 updates.map(update =>
