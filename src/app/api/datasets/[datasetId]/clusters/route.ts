@@ -11,7 +11,7 @@ import { NextRequest, NextResponse } from 'next/server'
  * Response:
  *   {
  *     run: { id, status, total_keywords, processed_keywords },
- *     stats: { total_analyzed, core_feature, adjacent_feature, competitor, unrelated, ambiguous },
+ *     stats: { total_analyzed, core_feature, feature_variant, problem_solving, discovery, brand_competitor, category, adjacent, unrelated },
  *     clusters: ClusterWithKeywords[]
  *   }
  */
@@ -62,10 +62,13 @@ export async function GET(
     const stats = {
         total_analyzed: intentRows?.length ?? 0,
         core_feature: 0,
-        adjacent_feature: 0,
-        competitor: 0,
+        feature_variant: 0,
+        problem_solving: 0,
+        discovery: 0,
+        brand_competitor: 0,
+        category: 0,
+        adjacent: 0,
         unrelated: 0,
-        ambiguous: 0,
     }
 
     for (const row of (intentRows || [])) {
@@ -99,11 +102,11 @@ export async function GET(
 
     const { data: intentResultMap } = await supabase
         .from('keyword_intent_results')
-        .select('keyword_id, sub_intent, intent_score')
+        .select('keyword_id, primary_intent, sub_intent, intent_score')
         .eq('run_id', run.id)
 
     const intentByKeyword = new Map(
-        (intentResultMap || []).map(r => [r.keyword_id, { sub_intent: r.sub_intent, intent_score: r.intent_score }])
+        (intentResultMap || []).map(r => [r.keyword_id, { primary_intent: r.primary_intent, sub_intent: r.sub_intent, intent_score: r.intent_score }])
     )
 
     // Load keyword texts
@@ -131,7 +134,8 @@ export async function GET(
             const intent = intentByKeyword.get(kwId)
             return {
                 id: kwId,
-                keyword: kw?.keyword_en || kw?.keyword || kwId,
+                keyword: kw?.keyword || kw?.keyword_en || kwId,
+                primary_intent: intent?.primary_intent || null,
                 sub_intent: intent?.sub_intent || null,
                 intent_score: intent?.intent_score ?? null,
             }

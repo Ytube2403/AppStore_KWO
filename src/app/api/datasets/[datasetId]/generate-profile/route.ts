@@ -4,7 +4,7 @@ import { scrapeAppInfo, parseStoreUrl } from '@/lib/store-scraper'
 import { GoogleGenAI } from '@google/genai'
 
 // Use stable model — not preview/experimental which may be unavailable or deprecated
-const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
+const geminiModel = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite-preview'
 
 export type AppProfile = {
     title: string

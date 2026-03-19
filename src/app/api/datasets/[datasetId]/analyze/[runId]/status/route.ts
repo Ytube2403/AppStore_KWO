@@ -53,13 +53,13 @@ export async function GET(
         const intentJob = jobs.find(j => j.job_type === 'intent_analysis')
         const clusterJob = jobs.find(j => j.job_type === 'clustering')
 
-        if (clusterJob?.status === 'done' || clusterJob?.status === 'completed') {
+        if (clusterJob?.status === 'completed') {
             phase = 'done'
             progress = 100
-        } else if (clusterJob?.status === 'running' || (intentJob?.status === 'done' || intentJob?.status === 'completed')) {
+        } else if (clusterJob?.status === 'processing' || intentJob?.status === 'completed') {
             phase = 'clustering'
             progress = 70 + Math.round((clusterJob?.progress_percent ?? 0) * 0.3)
-        } else if (intentJob?.status === 'running' || (serpJob?.status === 'done' || serpJob?.status === 'completed')) {
+        } else if (intentJob?.status === 'processing' || serpJob?.status === 'completed') {
             phase = 'intent_analysis'
             progress = 35 + Math.round((intentJob?.progress_percent ?? 0) * 0.35)
         } else {

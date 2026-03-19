@@ -33,6 +33,11 @@ export async function POST(
     try {
         const body = await req.json()
         keywordIds = body.keywordIds
+        const rawTier = body.modelTier
+        if (rawTier !== undefined && rawTier !== 'free' && rawTier !== 'premium') {
+            return NextResponse.json({ error: 'modelTier must be "free" or "premium"' }, { status: 400 })
+        }
+        var modelTier: 'free' | 'premium' = rawTier === 'premium' ? 'premium' : 'free'
         if (!Array.isArray(keywordIds) || keywordIds.length === 0) {
             return NextResponse.json({ error: 'keywordIds must be a non-empty array' }, { status: 400 })
         }
@@ -101,7 +106,7 @@ export async function POST(
             job_type: 'serp_fetch',
             priority: 5,
             // run_id will be patched in step 3; worker will not start until priority ordering
-            payload: { keyword_ids: capped, dataset_id: datasetId },
+            payload: { keyword_ids: capped, dataset_id: datasetId, model_tier: modelTier },
         })
         .select('id')
         .single()
@@ -137,7 +142,7 @@ export async function POST(
     // intentJob and clusterJob (steps 4-5) already have run_id from the start.
     await supabase
         .from('analysis_jobs')
-        .update({ payload: { keyword_ids: capped, run_id: runId, dataset_id: datasetId } })
+        .update({ payload: { keyword_ids: capped, run_id: runId, dataset_id: datasetId, model_tier: modelTier } })
         .eq('id', serpJob.id)
 
     // ── 4. Enqueue intent_analysis job (priority 6) with run_id ──────────────
@@ -147,7 +152,7 @@ export async function POST(
             ...commonJobFields,
             job_type: 'intent_analysis',
             priority: 6,
-            payload: { keyword_ids: capped, run_id: runId, dataset_id: datasetId },
+            payload: { keyword_ids: capped, run_id: runId, dataset_id: datasetId, model_tier: modelTier },
         })
         .select('id')
         .single()
@@ -165,7 +170,7 @@ export async function POST(
             ...commonJobFields,
             job_type: 'clustering',
             priority: 7,
-            payload: { run_id: runId, dataset_id: datasetId },
+            payload: { run_id: runId, dataset_id: datasetId, model_tier: modelTier },
         })
         .select('id')
         .single()

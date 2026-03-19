@@ -17,7 +17,7 @@ import {
 } from '@tanstack/react-table'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import React from 'react'
-import { Download, Edit2, Check, X, Loader2, ChevronDown, Filter, Sparkles, HelpCircle, Globe, PlayCircle, AlertTriangle, BarChart2, ChevronRight, Tag, TrendingUp, RefreshCw, CheckCircle2 } from 'lucide-react'
+import { Download, Edit2, Check, X, Loader2, ChevronDown, ChevronUp, Filter, Sparkles, HelpCircle, Globe, PlayCircle, AlertTriangle, BarChart2, ChevronRight, Tag, TrendingUp, RefreshCw, CheckCircle2, ArrowRightLeft, Trash2 } from 'lucide-react'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
@@ -106,11 +106,20 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
     const [activeTab, setActiveTab] = useState<'keywords' | 'intent'>('keywords')
     const [isGeneratingProfile, setIsGeneratingProfile] = useState(false)
     const [isStartingAnalysis, setIsStartingAnalysis] = useState(false)
+    const [modelTier, setModelTier] = useState<'free' | 'premium'>('free')
     const [analysisRunId, setAnalysisRunId] = useState<string | null>(null)
     const [analysisProgress, setAnalysisProgress] = useState(0)
     const [analysisPhase, setAnalysisPhase] = useState<'serp_fetch' | 'intent_analysis' | 'clustering' | 'done'>('serp_fetch')
     const [clusterResults, setClusterResults] = useState<{ run: any; stats: any; clusters: any[] } | null>(null)
     const [expandedCluster, setExpandedCluster] = useState<string | null>(null)
+    // Cluster filter bridge (§5.5): when user clicks "View in Keywords", we store
+    // the keyword IDs of that cluster and filter the Keyword tab accordingly.
+    const [clusterKeywordFilter, setClusterKeywordFilter] = useState<{ ids: Set<string>; clusterName: string } | null>(null)
+    // Opportunity Matrix toggle
+    const [showMatrix, setShowMatrix] = useState(false)
+    const [matrixTooltip, setMatrixTooltip] = useState<{ keyword: string; volume: number; difficulty: number; score: number; intent: string } | null>(null)
+    // Intent stats panel collapse toggle
+    const [isStatsCollapsed, setIsStatsCollapsed] = useState(false)
 
     // Basic Filter States
     const [minVolume, setMinVolume] = useState('')
@@ -119,6 +128,12 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
     const [minMyRank, setMinMyRank] = useState('')
     const [showSelectedOnly, setShowSelectedOnly] = useState(false)
     const [hideDisqualified, setHideDisqualified] = useState(true)
+    // Scoring mode: controls how total_score is displayed / applied
+    // 'view' = show current scores as-is
+    // 'soft' = preview adjusted scores locally without persisting
+    // 'strong' = call recalculate API and reload
+    const [scoringMode, setScoringMode] = useState<'view' | 'soft' | 'strong'>('view')
+    const [isRecalculating, setIsRecalculating] = useState(false)
 
     // Derived KPI Metrics
     const myKeywordsCount = useMemo(() => data.filter(k => k.my_rank !== null).length, [data])
@@ -137,6 +152,28 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
         })
         return dist
     }, [data])
+
+    // Opportunity Matrix: join clusterResults keywords with data[] to get volume/difficulty/score
+    const opportunityMatrixData = useMemo(() => {
+        if (!clusterResults?.clusters) return []
+        const dataById = new Map(data.map(d => [d.id, d]))
+        const points: Array<{ id: string; keyword: string; volume: number; difficulty: number; score: number; intent: string }> = []
+        for (const cluster of clusterResults.clusters) {
+            for (const kw of (cluster.keywords ?? [])) {
+                const base = dataById.get(kw.id)
+                if (!base) continue
+                points.push({
+                    id: kw.id,
+                    keyword: kw.keyword ?? base.keyword,
+                    volume: base.volume ?? 0,
+                    difficulty: base.difficulty ?? 50,
+                    score: base.total_score ?? 0,
+                    intent: cluster.cluster_intent ?? 'discovery',
+                })
+            }
+        }
+        return points
+    }, [clusterResults, data])
 
     const loadData = async () => {
         setIsLoading(true)
@@ -188,8 +225,58 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
 
     useEffect(() => {
         loadData()
+        // Auto-load persisted cluster results on mount
+        ;(async () => {
+            try {
+                const res = await fetch(`/api/datasets/${dataset.id}/clusters`)
+                if (res.ok) {
+                    const json = await res.json()
+                    if (json.clusters && json.clusters.length > 0) {
+                        setClusterResults(json)
+                    }
+                }
+            } catch {}
+        })()
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [dataset.id])
+
+    // ── Tag Sync: merge intent + cluster tags from clusterResults into keyword rows ──
+    useEffect(() => {
+        if (!clusterResults?.clusters || clusterResults.clusters.length === 0) return
+        if (data.length === 0) return
+
+        // Build keyword_id → tags map from cluster results
+        const tagMap = new Map<string, string[]>()
+        for (const cluster of clusterResults.clusters) {
+            const clusterName = cluster.cluster_name as string
+            for (const kw of (cluster.keywords || [])) {
+                const tags: string[] = []
+                if (kw.primary_intent) tags.push(`intent:${kw.primary_intent}`)
+                if (clusterName) tags.push(`cluster:${clusterName}`)
+                if (tags.length > 0) tagMap.set(kw.id, tags)
+            }
+        }
+
+        if (tagMap.size === 0) return
+
+        // Merge tags into data rows (only if any row is missing tags)
+        let needsUpdate = false
+        for (const row of data) {
+            const newTags = tagMap.get(row.id)
+            if (newTags && (!row.tags || row.tags.length === 0)) {
+                needsUpdate = true
+                break
+            }
+        }
+
+        if (needsUpdate) {
+            setData(prev => prev.map(row => {
+                const newTags = tagMap.get(row.id)
+                if (newTags) return { ...row, tags: newTags }
+                return row
+            }))
+        }
+    }, [clusterResults, data.length])
 
     // Poll analysis run status when a run is active
     useEffect(() => {
@@ -266,7 +353,56 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
         {
             accessorKey: 'keyword',
             header: 'Keyword',
-            size: 250,
+            size: 240,
+            cell: (info) => <span className="truncate">{info.getValue() as string}</span>,
+        },
+        {
+            id: 'intent',
+            header: 'Intent',
+            size: 100,
+            accessorFn: (row: any) => {
+                const tags: string[] = row.tags || []
+                const intentTag = tags.find((t: string) => t.startsWith('intent:'))
+                return intentTag ? intentTag.replace('intent:', '') : ''
+            },
+            cell: (info) => {
+                const intent = info.getValue() as string
+                if (!intent) return <span className="text-gray-300">—</span>
+                const intentColors: Record<string, string> = {
+                    core_feature: 'bg-emerald-100 text-emerald-700',
+                    feature_variant: 'bg-cyan-100 text-cyan-700',
+                    problem_solving: 'bg-violet-100 text-violet-700',
+                    discovery: 'bg-amber-100 text-amber-700',
+                    brand_competitor: 'bg-red-100 text-red-700',
+                    category: 'bg-blue-100 text-blue-700',
+                    adjacent: 'bg-orange-100 text-orange-700',
+                    unrelated: 'bg-gray-100 text-gray-600',
+                }
+                return (
+                    <span className={`inline-flex items-center text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${intentColors[intent] || 'bg-gray-100 text-gray-600'}`}>
+                        {intent.replace(/_/g, ' ')}
+                    </span>
+                )
+            },
+        },
+        {
+            id: 'cluster',
+            header: 'Cluster',
+            size: 110,
+            accessorFn: (row: any) => {
+                const tags: string[] = row.tags || []
+                const clusterTag = tags.find((t: string) => t.startsWith('cluster:'))
+                return clusterTag ? clusterTag.replace('cluster:', '') : ''
+            },
+            cell: (info) => {
+                const cluster = info.getValue() as string
+                if (!cluster) return <span className="text-gray-300">—</span>
+                return (
+                    <span className="inline-flex items-center text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700 truncate max-w-[100px]">
+                        {cluster}
+                    </span>
+                )
+            },
         },
         {
             accessorKey: 'total_score',
@@ -349,7 +485,9 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
     const rowSelectionDependency = showSelectedOnly ? rowSelection : null;
 
     const filteredData = useMemo(() => {
-        return data.filter((row, index) => {
+        return data.filter((row) => {
+            // Cluster filter bridge: when active, only show keywords in the selected cluster
+            if (clusterKeywordFilter && !clusterKeywordFilter.ids.has(row.id)) return false
             if (minVolume && (row.volume === null || row.volume < parseFloat(minVolume))) return false
             // minMaxVolume: passes if max_volume >= threshold (OR if max_volume is null, let it pass)
             const effectiveMaxVol = !row.max_volume || row.max_volume === 0 ? (row.volume ?? 0) : row.max_volume
@@ -363,7 +501,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
             }
             return true
         })
-    }, [data, minVolume, minMaxVolume, maxDifficulty, minMyRank, showSelectedOnly, hideDisqualified, rowSelectionDependency])
+    }, [data, clusterKeywordFilter, minVolume, minMaxVolume, maxDifficulty, minMyRank, showSelectedOnly, hideDisqualified, rowSelectionDependency])
 
     const table = useReactTable({
         data: filteredData,
@@ -628,6 +766,51 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
         return () => clearInterval(interval)
     }, [activeJobId, supabase])
 
+    // ── Analysis run polling useEffect — polls status every 5s while job is running ──
+    useEffect(() => {
+        if (!analysisRunId) return
+
+        const interval = setInterval(async () => {
+            try {
+                const res = await fetch(`/api/datasets/${dataset.id}/analyze/${analysisRunId}/status`)
+                if (!res.ok) return
+                const json = await res.json()
+
+                // Update phase + progress
+                if (json.phase && json.phase !== 'done') {
+                    setAnalysisPhase(json.phase as 'serp_fetch' | 'intent_analysis' | 'clustering')
+                }
+                if (typeof json.progress === 'number') {
+                    setAnalysisProgress(json.progress)
+                }
+
+                if (json.status === 'done') {
+                    clearInterval(interval)
+                    setAnalysisProgress(100)
+                    // Fetch clusters
+                    try {
+                        const cRes = await fetch(`/api/datasets/${dataset.id}/clusters?run_id=${analysisRunId}`)
+                        if (cRes.ok) {
+                            const cJson = await cRes.json()
+                            setClusterResults(cJson)
+                        }
+                    } catch {}
+                    setAnalysisRunId(null)
+                    toast.success('Analysis complete! Clusters are ready.')
+                } else if (json.status === 'failed') {
+                    clearInterval(interval)
+                    setAnalysisRunId(null)
+                    setAnalysisProgress(0)
+                    toast.error('Analysis failed. Please check logs and try again.')
+                }
+            } catch (err) {
+                console.error('Analysis polling error:', err)
+            }
+        }, 5000) // poll every 5s
+
+        return () => clearInterval(interval)
+    }, [analysisRunId, dataset.id])
+
     // Virtualizer
     const parentRef = useRef<HTMLDivElement>(null)
 
@@ -642,6 +825,60 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
 
     return (
         <>
+            {/* Settings Dialog — rendered outside tab conditionals so it works from any tab */}
+            <Dialog open={isEditingSettings} onOpenChange={setIsEditingSettings}>
+                <DialogContent>
+                    <DialogHeader>
+                        <DialogTitle>Dataset Settings</DialogTitle>
+                    </DialogHeader>
+                    <div className="py-4 space-y-4">
+                        <div className="space-y-2">
+                            <Label>Dataset Name <span className="text-red-500">*</span></Label>
+                            <Input
+                                value={newName}
+                                onChange={e => setNewName(e.target.value)}
+                                placeholder="Dataset Name"
+                                autoFocus
+                                onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Country / Market <span className="text-gray-400 font-normal">(Optional)</span></Label>
+                            <Input
+                                value={newMarket}
+                                onChange={e => setNewMarket(e.target.value)}
+                                placeholder="e.g. US, Brazil, Global"
+                                onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Concept / Topic <span className="text-gray-400 font-normal">(Optional)</span></Label>
+                            <Input
+                                value={newConcept}
+                                onChange={e => setNewConcept(e.target.value)}
+                                placeholder="e.g. Brand, Casual, Competitors"
+                                onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <Label className="flex items-center gap-1">
+                                <Globe className="h-3.5 w-3.5" /> Target App Store URL <span className="text-gray-400 font-normal">(Optional)</span>
+                            </Label>
+                            <Input
+                                value={newTargetAppUrl}
+                                onChange={e => setNewTargetAppUrl(e.target.value)}
+                                placeholder="https://apps.apple.com/... or https://play.google.com/..."
+                            />
+                            <p className="text-[11px] text-gray-400">Used to generate an AI-powered App Profile for Intent Analysis.</p>
+                        </div>
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setIsEditingSettings(false)} disabled={isSavingSettings}>Cancel</Button>
+                        <Button onClick={handleSaveSettings} disabled={isSavingSettings || !newName.trim()}>Save Changes</Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
             <div className="flex flex-col h-full w-[calc(100%-3rem)] mx-auto bg-white border-x border-gray-200 relative overflow-hidden shadow-[0_0_20px_rgb(0,0,0,0.03)]">
                 {/* Header */}
                 <div className="flex justify-between items-center p-4 border-b bg-white z-10 shrink-0">
@@ -664,61 +901,9 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                 </div>
                             )}
 
-                            <Dialog open={isEditingSettings} onOpenChange={setIsEditingSettings}>
-                                <Button size="icon" variant="ghost" className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity text-gray-500" onClick={() => setIsEditingSettings(true)}>
-                                    <Edit2 className="h-3.5 w-3.5" />
-                                </Button>
-                                <DialogContent>
-                                    <DialogHeader>
-                                        <DialogTitle>Dataset Settings</DialogTitle>
-                                    </DialogHeader>
-                                    <div className="py-4 space-y-4">
-                                        <div className="space-y-2">
-                                            <Label>Dataset Name <span className="text-red-500">*</span></Label>
-                                            <Input
-                                                value={newName}
-                                                onChange={e => setNewName(e.target.value)}
-                                                placeholder="Dataset Name"
-                                                autoFocus
-                                                onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
-                                            />
-                                        </div>
-                                        <div className="space-y-2">
-                                            <Label>Country / Market <span className="text-gray-400 font-normal">(Optional)</span></Label>
-                                            <Input
-                                                value={newMarket}
-                                                onChange={e => setNewMarket(e.target.value)}
-                                                placeholder="e.g. US, Brazil, Global"
-                                                onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
-                                            />
-                                        </div>
-                                        <div className="space-y-2">
-                                            <Label>Concept / Topic <span className="text-gray-400 font-normal">(Optional)</span></Label>
-                                            <Input
-                                                value={newConcept}
-                                                onChange={e => setNewConcept(e.target.value)}
-                                                placeholder="e.g. Brand, Casual, Competitors"
-                                                onKeyDown={e => e.key === 'Enter' && handleSaveSettings()}
-                                            />
-                                        </div>
-                                        <div className="space-y-2">
-                                            <Label className="flex items-center gap-1">
-                                                <Globe className="h-3.5 w-3.5" /> Target App Store URL <span className="text-gray-400 font-normal">(Optional)</span>
-                                            </Label>
-                                            <Input
-                                                value={newTargetAppUrl}
-                                                onChange={e => setNewTargetAppUrl(e.target.value)}
-                                                placeholder="https://apps.apple.com/... or https://play.google.com/..."
-                                            />
-                                            <p className="text-[11px] text-gray-400">Used to generate an AI-powered App Profile for Intent Analysis.</p>
-                                        </div>
-                                    </div>
-                                    <DialogFooter>
-                                        <Button variant="outline" onClick={() => setIsEditingSettings(false)} disabled={isSavingSettings}>Cancel</Button>
-                                        <Button onClick={handleSaveSettings} disabled={isSavingSettings || !newName.trim()}>Save Changes</Button>
-                                    </DialogFooter>
-                                </DialogContent>
-                            </Dialog>
+                            <Button size="icon" variant="ghost" className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity text-gray-500" onClick={() => setIsEditingSettings(true)}>
+                                <Edit2 className="h-3.5 w-3.5" />
+                            </Button>
 
                         </div>
 
@@ -1023,7 +1208,75 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                             </div>
                         </div>
 
-                        <div className="pl-4 ml-1 border-l border-gray-200">
+                        <div className="pl-4 ml-1 border-l border-gray-200 flex items-center gap-2">
+                            {/* Scoring Mode Dropdown */}
+                            <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className={`h-8 text-xs font-medium gap-1.5 transition-colors ${
+                                            scoringMode === 'soft'
+                                                ? 'bg-amber-50 border-amber-300 text-amber-700'
+                                                : scoringMode === 'strong'
+                                                    ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
+                                                    : ''
+                                        }`}
+                                        disabled={isRecalculating}
+                                    >
+                                        {isRecalculating
+                                            ? <Loader2 className="h-3 w-3 animate-spin" />
+                                            : <TrendingUp className="h-3 w-3" />}
+                                        Score: {scoringMode === 'view' ? 'View' : scoringMode === 'soft' ? 'Soft Apply' : 'Strong Apply'}
+                                        <ChevronDown className="h-3 w-3 ml-0.5 text-gray-400" />
+                                    </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-52">
+                                    <DropdownMenuItem
+                                        className={`text-xs gap-2 ${scoringMode === 'view' ? 'bg-gray-50 font-semibold' : ''}`}
+                                        onClick={() => setScoringMode('view')}
+                                    >
+                                        <span className="h-2 w-2 rounded-full bg-gray-400 shrink-0" />
+                                        <div>
+                                            <div className="font-medium">View</div>
+                                            <div className="text-gray-400 text-[10px]">Show current scores as-is</div>
+                                        </div>
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                        className={`text-xs gap-2 ${scoringMode === 'soft' ? 'bg-amber-50 font-semibold' : ''}`}
+                                        onClick={() => setScoringMode('soft')}
+                                    >
+                                        <span className="h-2 w-2 rounded-full bg-amber-400 shrink-0" />
+                                        <div>
+                                            <div className="font-medium text-amber-700">Soft Apply</div>
+                                            <div className="text-gray-400 text-[10px]">Preview boost locally, no save</div>
+                                        </div>
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                        className={`text-xs gap-2 ${scoringMode === 'strong' ? 'bg-emerald-50 font-semibold' : ''}`}
+                                        onClick={async () => {
+                                            setScoringMode('strong')
+                                            setIsRecalculating(true)
+                                            try {
+                                                await fetch(`/api/datasets/${dataset.id}/recalculate`, { method: 'POST' })
+                                                await loadData()
+                                                toast.success('Scores recalculated')
+                                            } catch {
+                                                toast.error('Recalculate failed')
+                                            } finally {
+                                                setIsRecalculating(false)
+                                            }
+                                        }}
+                                    >
+                                        <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" />
+                                        <div>
+                                            <div className="font-medium text-emerald-700">Strong Apply</div>
+                                            <div className="text-gray-400 text-[10px]">Recalculate & save to database</div>
+                                        </div>
+                                    </DropdownMenuItem>
+                                </DropdownMenuContent>
+                            </DropdownMenu>
+
                             <Button
                                 variant="secondary"
                                 size="sm"
@@ -1039,7 +1292,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                 </div>
 
                 {/* Tab Navigation */}
-                <div className="flex border-b bg-white px-4 shrink-0">
+                <div className="flex border-b bg-white px-4 shrink-0 items-center">
                     <button
                         className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
                             activeTab === 'keywords'
@@ -1064,6 +1317,20 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                             <span className="ml-1 text-[10px] bg-emerald-100 text-emerald-700 rounded-full px-1.5 py-0.5 font-semibold">AI</span>
                         )}
                     </button>
+                    {/* Cluster filter active badge */}
+                    {clusterKeywordFilter && activeTab === 'keywords' && (
+                        <div className="ml-3 flex items-center gap-1.5 bg-[#FF8903]/10 border border-[#FF8903]/30 text-[#FF8903] text-[11px] font-semibold rounded-full px-2.5 py-1">
+                            <Filter className="h-3 w-3" />
+                            <span className="max-w-[140px] truncate">{clusterKeywordFilter.clusterName}</span>
+                            <button
+                                onClick={() => setClusterKeywordFilter(null)}
+                                className="ml-0.5 text-[#FF8903]/60 hover:text-[#FF8903] transition-colors"
+                                aria-label="Clear cluster filter"
+                            >
+                                <X className="h-3 w-3" />
+                            </button>
+                        </div>
+                    )}
                 </div>
 
                 {activeTab === 'keywords' && (
@@ -1271,7 +1538,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                 <Button
                                     size="sm"
                                     className="gap-2 bg-[#FF8903] hover:bg-[#FEB107] text-white"
-                                    onClick={() => { setNewTargetAppUrl(datasetTargetAppUrl); setIsEditingSettings(true); setActiveTab('keywords') }}
+                                    onClick={() => { setNewTargetAppUrl(datasetTargetAppUrl); setIsEditingSettings(true) }}
                                 >
                                     <Edit2 className="h-4 w-4" />
                                     Open Dataset Settings
@@ -1369,6 +1636,38 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                             </p>
                                         </div>
                                     </div>
+
+                                    {/* ── Model Tier Toggle ── */}
+                                    <div className="mt-3 flex items-center gap-3">
+                                        <span className="text-xs font-semibold text-amber-700">AI Model:</span>
+                                        <div className="inline-flex rounded-lg border border-amber-200 overflow-hidden">
+                                            <button
+                                                type="button"
+                                                className={`px-3 py-1 text-xs font-medium transition-colors ${
+                                                    modelTier === 'free'
+                                                        ? 'bg-amber-600 text-white'
+                                                        : 'bg-white text-amber-700 hover:bg-amber-50'
+                                                }`}
+                                                onClick={() => setModelTier('free')}
+                                            >
+                                                ⚡ Free
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className={`px-3 py-1 text-xs font-medium transition-colors ${
+                                                    modelTier === 'premium'
+                                                        ? 'bg-amber-600 text-white'
+                                                        : 'bg-white text-amber-700 hover:bg-amber-50'
+                                                }`}
+                                                onClick={() => setModelTier('premium')}
+                                            >
+                                                🚀 Premium
+                                            </button>
+                                        </div>
+                                        <span className="text-[10px] text-amber-600">
+                                            {modelTier === 'free' ? 'MiniMax M2.5 (slower, may rate-limit)' : 'Qwen 3.5 Flash (faster, paid)'}
+                                        </span>
+                                    </div>
                                     <div className="flex gap-2">
                                         <Button
                                             size="sm"
@@ -1385,7 +1684,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                                     const res = await fetch(`/api/datasets/${dataset.id}/analyze`, {
                                                         method: 'POST',
                                                         headers: { 'Content-Type': 'application/json' },
-                                                        body: JSON.stringify({ keywordIds: eligible })
+                                                        body: JSON.stringify({ keywordIds: eligible, modelTier })
                                                     })
                                                     const json = await res.json()
                                                     if (!res.ok) throw new Error(json.error || 'Failed to start analysis')
@@ -1409,7 +1708,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                             size="sm"
                                             variant="outline"
                                             className="gap-2"
-                                            onClick={() => { setNewTargetAppUrl(datasetTargetAppUrl); setIsEditingSettings(true); setActiveTab('keywords') }}
+                                            onClick={() => { setNewTargetAppUrl(datasetTargetAppUrl); setIsEditingSettings(true) }}
                                         >
                                             <Globe className="h-4 w-4" /> Change URL
                                         </Button>
@@ -1480,28 +1779,67 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                             Analysis Complete — {clusterResults.clusters?.length ?? 0} clusters · {clusterResults.stats?.total_analyzed ?? 0} keywords
                                         </span>
                                     </div>
-                                    <Button
-                                        size="sm"
-                                        variant="outline"
-                                        className="gap-1.5 text-xs"
-                                        onClick={() => {
-                                            setClusterResults(null)
-                                            setAnalysisPhase('serp_fetch')
-                                        }}
-                                    >
-                                        <RefreshCw className="h-3 w-3" /> Re-run
-                                    </Button>
+                                    <div className="flex items-center gap-2">
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            className={`gap-1.5 text-xs transition-colors ${
+                                                showMatrix
+                                                    ? 'bg-[#FF8903]/10 border-[#FF8903]/40 text-[#FF8903]'
+                                                    : ''
+                                            }`}
+                                            onClick={() => setShowMatrix(v => !v)}
+                                            disabled={isStatsCollapsed}
+                                        >
+                                            <BarChart2 className="h-3 w-3" />
+                                            {showMatrix ? 'Hide Matrix' : 'Opportunity Matrix'}
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            className="gap-1.5 text-xs"
+                                            onClick={() => {
+                                                setClusterResults(null)
+                                                setAnalysisPhase('serp_fetch')
+                                            }}
+                                        >
+                                            <RefreshCw className="h-3 w-3" /> Re-run
+                                        </Button>
+                                        {/* Collapse/Expand stats panel button */}
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            className={`gap-1.5 text-xs font-semibold transition-all border ${
+                                                isStatsCollapsed
+                                                    ? 'bg-indigo-600 text-white border-indigo-600 hover:bg-indigo-700 hover:border-indigo-700'
+                                                    : 'bg-white text-indigo-600 border-indigo-300 hover:bg-indigo-50 hover:border-indigo-400'
+                                            }`}
+                                            onClick={() => setIsStatsCollapsed(v => !v)}
+                                            title={isStatsCollapsed ? 'Expand stats panel' : 'Collapse stats panel'}
+                                        >
+                                            <ChevronUp className={`h-3.5 w-3.5 transition-transform duration-200 ${isStatsCollapsed ? 'rotate-180' : ''}`} />
+                                            {isStatsCollapsed ? 'Show Stats' : 'Hide Stats'}
+                                        </Button>
+                                    </div>
                                 </div>
 
-                                {/* Intent Summary Bar */}
+                                {/* Intent Summary Bar + Opportunity Matrix — collapsible */}
+                                <div
+                                    className={`overflow-hidden transition-all duration-300 ease-in-out shrink-0 ${
+                                        isStatsCollapsed ? 'max-h-0 opacity-0' : 'max-h-[600px] opacity-100'
+                                    }`}
+                                >
                                 {clusterResults.stats && (
-                                    <div className="grid grid-cols-5 gap-3 px-6 py-4 shrink-0">
+                                    <div className="grid grid-cols-4 gap-3 px-6 py-4">
                                         {[
                                             { key: 'core_feature', label: 'Core Feature', color: 'bg-emerald-500', textColor: 'text-emerald-700', bg: 'bg-emerald-50 border-emerald-200' },
-                                            { key: 'adjacent_feature', label: 'Adjacent', color: 'bg-blue-400', textColor: 'text-blue-700', bg: 'bg-blue-50 border-blue-200' },
-                                            { key: 'competitor', label: 'Competitor', color: 'bg-red-400', textColor: 'text-red-700', bg: 'bg-red-50 border-red-200' },
+                                            { key: 'feature_variant', label: 'Feature Variant', color: 'bg-cyan-500', textColor: 'text-cyan-700', bg: 'bg-cyan-50 border-cyan-200' },
+                                            { key: 'problem_solving', label: 'Problem Solving', color: 'bg-violet-500', textColor: 'text-violet-700', bg: 'bg-violet-50 border-violet-200' },
+                                            { key: 'discovery', label: 'Discovery', color: 'bg-amber-400', textColor: 'text-amber-700', bg: 'bg-amber-50 border-amber-200' },
+                                            { key: 'brand_competitor', label: 'Brand/Competitor', color: 'bg-red-400', textColor: 'text-red-700', bg: 'bg-red-50 border-red-200' },
+                                            { key: 'category', label: 'Category', color: 'bg-blue-400', textColor: 'text-blue-700', bg: 'bg-blue-50 border-blue-200' },
+                                            { key: 'adjacent', label: 'Adjacent', color: 'bg-orange-400', textColor: 'text-orange-700', bg: 'bg-orange-50 border-orange-200' },
                                             { key: 'unrelated', label: 'Unrelated', color: 'bg-gray-400', textColor: 'text-gray-600', bg: 'bg-gray-50 border-gray-200' },
-                                            { key: 'ambiguous', label: 'Ambiguous', color: 'bg-amber-400', textColor: 'text-amber-700', bg: 'bg-amber-50 border-amber-200' },
                                         ].map(({ key, label, textColor, bg }) => (
                                             <div key={key} className={`rounded-xl border px-4 py-3 flex flex-col gap-1 ${bg}`}>
                                                 <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{label}</span>
@@ -1518,24 +1856,158 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                     </div>
                                 )}
 
+                                {/* Opportunity Matrix — collapsible bubble chart */}
+                                {showMatrix && (
+                                    <div className="px-6 py-4 border-b bg-white shrink-0">
+                                        <p className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">
+                                            Opportunity Matrix — Volume vs Difficulty (bubble size = score)
+                                        </p>
+                                        {opportunityMatrixData.length === 0 ? (
+                                            <div className="flex items-center justify-center h-40 text-sm text-gray-400">
+                                                No keyword data available for matrix
+                                            </div>
+                                        ) : (() => {
+                                            const intentColors: Record<string, string> = {
+                                                core_feature: '#10b981',
+                                                feature_variant: '#06b6d4',
+                                                problem_solving: '#8b5cf6',
+                                                discovery: '#f59e0b',
+                                                brand_competitor: '#ef4444',
+                                                category: '#3b82f6',
+                                                adjacent: '#f97316',
+                                                unrelated: '#9ca3af',
+                                            }
+                                            const W = 720, H = 280
+                                            const PAD = { top: 16, right: 20, bottom: 36, left: 52 }
+                                            const innerW = W - PAD.left - PAD.right
+                                            const innerH = H - PAD.top - PAD.bottom
+                                            const maxVol = Math.max(...opportunityMatrixData.map(p => p.volume), 1)
+                                            const toX = (v: number) => PAD.left + (v / maxVol) * innerW
+                                            // Y: difficulty 0 → bottom (good), 100 → top (hard) — inverted
+                                            const toY = (d: number) => PAD.top + ((100 - d) / 100) * innerH
+                                            const toR = (s: number) => 3 + (s / 100) * 10
+                                            // Tick helpers
+                                            const xTicks = [0, 0.25, 0.5, 0.75, 1.0].map(p => ({ pct: p, val: Math.round(maxVol * p) }))
+                                            const yTicks = [0, 25, 50, 75, 100]
+                                            return (
+                                                <div className="relative overflow-x-auto">
+                                                    <svg width={W} height={H} className="overflow-visible">
+                                                        {/* Grid lines */}
+                                                        {yTicks.map(d => (
+                                                            <line key={d}
+                                                                x1={PAD.left} y1={toY(d)}
+                                                                x2={PAD.left + innerW} y2={toY(d)}
+                                                                stroke="#f3f4f6" strokeWidth={1}
+                                                            />
+                                                        ))}
+                                                        {xTicks.map(t => (
+                                                            <line key={t.pct}
+                                                                x1={toX(t.val)} y1={PAD.top}
+                                                                x2={toX(t.val)} y2={PAD.top + innerH}
+                                                                stroke="#f3f4f6" strokeWidth={1}
+                                                            />
+                                                        ))}
+                                                        {/* Y axis labels */}
+                                                        {yTicks.map(d => (
+                                                            <text key={d}
+                                                                x={PAD.left - 6} y={toY(d) + 4}
+                                                                textAnchor="end" fontSize={10} fill="#9ca3af"
+                                                            >{d}</text>
+                                                        ))}
+                                                        {/* X axis labels */}
+                                                        {xTicks.map(t => (
+                                                            <text key={t.pct}
+                                                                x={toX(t.val)} y={H - PAD.bottom + 16}
+                                                                textAnchor="middle" fontSize={10} fill="#9ca3af"
+                                                            >{t.val >= 1000 ? `${(t.val/1000).toFixed(1)}k` : t.val}</text>
+                                                        ))}
+                                                        {/* Axis labels */}
+                                                        <text x={PAD.left + innerW / 2} y={H - 4} textAnchor="middle" fontSize={11} fill="#6b7280" fontWeight="600">Volume</text>
+                                                        <text
+                                                            x={14} y={PAD.top + innerH / 2}
+                                                            textAnchor="middle" fontSize={11} fill="#6b7280" fontWeight="600"
+                                                            transform={`rotate(-90, 14, ${PAD.top + innerH / 2})`}
+                                                        >Ease (100 - Diff)</text>
+                                                        {/* Bubbles */}
+                                                        {opportunityMatrixData.map(p => (
+                                                            <circle
+                                                                key={p.id}
+                                                                cx={toX(p.volume)}
+                                                                cy={toY(p.difficulty)}
+                                                                r={toR(p.score)}
+                                                                fill={intentColors[p.intent] ?? '#9ca3af'}
+                                                                fillOpacity={0.72}
+                                                                stroke={intentColors[p.intent] ?? '#9ca3af'}
+                                                                strokeWidth={1}
+                                                                className="cursor-pointer transition-opacity hover:fill-opacity-100"
+                                                                onMouseEnter={() => setMatrixTooltip({
+                                                                    keyword: p.keyword,
+                                                                    volume: p.volume,
+                                                                    difficulty: p.difficulty,
+                                                                    score: Math.round(p.score),
+                                                                    intent: p.intent.replace(/_/g, ' '),
+                                                                })}
+                                                                onMouseLeave={() => setMatrixTooltip(null)}
+                                                            />
+                                                        ))}
+                                                    </svg>
+                                                    {/* Legend */}
+                                                    <div className="flex flex-wrap gap-3 mt-2">
+                                                        {Object.entries({
+                                                            core_feature: { label: 'Core Feature', color: '#10b981' },
+                                                            feature_variant: { label: 'Feature Variant', color: '#06b6d4' },
+                                                            problem_solving: { label: 'Problem Solving', color: '#8b5cf6' },
+                                                            discovery: { label: 'Discovery', color: '#f59e0b' },
+                                                            brand_competitor: { label: 'Brand/Competitor', color: '#ef4444' },
+                                                            category: { label: 'Category', color: '#3b82f6' },
+                                                            adjacent: { label: 'Adjacent', color: '#f97316' },
+                                                            unrelated: { label: 'Unrelated', color: '#9ca3af' },
+                                                        }).map(([key, { label, color }]) => (
+                                                            <div key={key} className="flex items-center gap-1.5">
+                                                                <div className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: color }} />
+                                                                <span className="text-[10px] text-gray-500">{label}</span>
+                                                            </div>
+                                                        ))}
+                                                        <div className="flex items-center gap-1.5 ml-2 text-[10px] text-gray-400">
+                                                            <span>bubble size = score</span>
+                                                        </div>
+                                                    </div>
+                                                    {/* Tooltip */}
+                                                    {matrixTooltip && (
+                                                        <div className="absolute top-2 right-2 bg-gray-900/90 text-white text-xs rounded-lg px-3 py-2 pointer-events-none shadow-lg max-w-[200px]">
+                                                            <p className="font-semibold truncate">{matrixTooltip.keyword}</p>
+                                                            <p className="text-gray-300 mt-0.5">Vol: {matrixTooltip.volume.toLocaleString()} · Diff: {matrixTooltip.difficulty}</p>
+                                                            <p className="text-gray-300">Score: {matrixTooltip.score} · {matrixTooltip.intent}</p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )
+                                        })()}
+                                    </div>
+                                )}
+                                </div>{/* end collapsible stats+matrix wrapper */}
+
                                 {/* Cluster Table + Detail Panel */}
                                 <div className="flex flex-1 min-h-0 overflow-hidden gap-0">
                                     {/* Cluster list */}
                                     <div className="flex-1 min-w-0 overflow-y-auto">
                                         {/* Table header */}
-                                        <div className="grid grid-cols-[2fr_80px_80px_120px_100px] gap-0 border-b bg-white sticky top-0 z-10">
+                                        <div className="grid grid-cols-[2fr_105px_110px_145px_115px] gap-0 border-b bg-white sticky top-0 z-10">
                                             {['Cluster', 'Keywords', 'Avg Score', 'Intent', 'Strength'].map(h => (
-                                                <div key={h} className="px-4 py-2.5 text-[11px] font-bold text-gray-400 uppercase tracking-wider border-r last:border-r-0">{h}</div>
+                                                <div key={h} className="px-4 py-3 text-[11px] font-bold text-gray-400 uppercase tracking-wider border-r last:border-r-0 whitespace-nowrap">{h}</div>
                                             ))}
                                         </div>
                                         {/* Rows */}
                                         {(clusterResults.clusters ?? []).map((cluster: any) => {
                                             const intentColors: Record<string, string> = {
                                                 core_feature: 'bg-emerald-100 text-emerald-700',
-                                                adjacent_feature: 'bg-blue-100 text-blue-700',
-                                                competitor: 'bg-red-100 text-red-700',
+                                                feature_variant: 'bg-cyan-100 text-cyan-700',
+                                                problem_solving: 'bg-violet-100 text-violet-700',
+                                                discovery: 'bg-amber-100 text-amber-700',
+                                                brand_competitor: 'bg-red-100 text-red-700',
+                                                category: 'bg-blue-100 text-blue-700',
+                                                adjacent: 'bg-orange-100 text-orange-700',
                                                 unrelated: 'bg-gray-100 text-gray-600',
-                                                ambiguous: 'bg-amber-100 text-amber-700',
                                             }
                                             const intentBadge = intentColors[cluster.cluster_intent] ?? 'bg-gray-100 text-gray-600'
                                             const strengthPct = Math.round((cluster.avg_score ?? 0))
@@ -1544,7 +2016,7 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                                 <div
                                                     key={cluster.id}
                                                     onClick={() => setExpandedCluster(isActive ? null : cluster.id)}
-                                                    className={`grid grid-cols-[2fr_80px_80px_120px_100px] gap-0 border-b cursor-pointer transition-colors ${isActive ? 'bg-[#FF8903]/5 border-l-4 border-l-[#FF8903]' : 'hover:bg-gray-50'}`}
+                                                    className={`grid grid-cols-[2fr_105px_110px_145px_115px] gap-0 border-b cursor-pointer transition-colors ${isActive ? 'bg-[#FF8903]/5 border-l-4 border-l-[#FF8903]' : 'hover:bg-gray-50'}`}
                                                 >
                                                     <div className="px-4 py-3 border-r">
                                                         <p className="font-semibold text-sm text-gray-900 truncate">{cluster.cluster_name}</p>
@@ -1587,16 +2059,19 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                         if (!cluster) return null
                                         const intentColors: Record<string, string> = {
                                             core_feature: 'text-emerald-700 bg-emerald-100',
-                                            adjacent_feature: 'text-blue-700 bg-blue-100',
-                                            competitor: 'text-red-700 bg-red-100',
+                                            feature_variant: 'text-cyan-700 bg-cyan-100',
+                                            problem_solving: 'text-violet-700 bg-violet-100',
+                                            discovery: 'text-amber-700 bg-amber-100',
+                                            brand_competitor: 'text-red-700 bg-red-100',
+                                            category: 'text-blue-700 bg-blue-100',
+                                            adjacent: 'text-orange-700 bg-orange-100',
                                             unrelated: 'text-gray-600 bg-gray-100',
-                                            ambiguous: 'text-amber-700 bg-amber-100',
                                         }
                                         const badge = intentColors[cluster.cluster_intent] ?? 'text-gray-600 bg-gray-100'
                                         return (
-                                            <div className="w-72 shrink-0 border-l bg-white overflow-y-auto flex flex-col">
+                                            <div className="w-[380px] shrink-0 border-l bg-white overflow-y-auto flex flex-col">
                                                 {/* Panel header */}
-                                                <div className="px-4 py-3 border-b flex items-start justify-between gap-2 sticky top-0 bg-white z-10">
+                                                <div className="px-5 py-4 border-b flex items-start justify-between gap-2 sticky top-0 bg-white z-10">
                                                     <div className="min-w-0">
                                                         <p className="font-bold text-sm text-gray-900 leading-tight">{cluster.cluster_name}</p>
                                                         <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{cluster.cluster_theme}</p>
@@ -1610,40 +2085,118 @@ export default function DatasetClientView({ dataset, workspaceId }: { dataset: a
                                                 </div>
 
                                                 {/* Stats */}
-                                                <div className="px-4 py-3 border-b grid grid-cols-2 gap-3">
-                                                    <div>
-                                                        <p className="text-[10px] text-gray-400 uppercase font-bold">Keywords</p>
-                                                        <p className="font-black text-xl text-gray-900">{cluster.keyword_count}</p>
+                                                <div className="px-5 py-5 border-b">
+                                                    <div className="grid grid-cols-2 gap-4 mb-4">
+                                                        <div className="bg-gray-50 rounded-xl px-4 py-3">
+                                                            <p className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">Keywords</p>
+                                                            <p className="font-black text-3xl text-gray-900 leading-none">{cluster.keyword_count}</p>
+                                                        </div>
+                                                        <div className="bg-gray-50 rounded-xl px-4 py-3">
+                                                            <p className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">Avg Score</p>
+                                                            <p className="font-black text-3xl text-gray-900 leading-none">{cluster.avg_score?.toFixed(0) ?? '-'}</p>
+                                                        </div>
                                                     </div>
                                                     <div>
-                                                        <p className="text-[10px] text-gray-400 uppercase font-bold">Avg Score</p>
-                                                        <p className="font-black text-xl text-gray-900">{cluster.avg_score?.toFixed(0) ?? '-'}</p>
-                                                    </div>
-                                                    <div className="col-span-2">
-                                                        <p className="text-[10px] text-gray-400 uppercase font-bold mb-1">Intent</p>
-                                                        <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full ${badge}`}>
+                                                        <p className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-2">Intent</p>
+                                                        <span className={`text-sm font-bold px-3 py-1.5 rounded-full ${badge}`}>
                                                             {cluster.cluster_intent?.replace(/_/g, ' ')}
                                                         </span>
                                                     </div>
                                                 </div>
 
                                                 {/* Keywords list */}
-                                                <div className="flex-1 px-4 py-3">
-                                                    <p className="text-[10px] text-gray-400 uppercase font-bold mb-2">Member Keywords</p>
+                                                <div className="flex-1 px-5 py-4">
+                                                    <div className="flex items-center justify-between mb-2">
+                                                        <p className="text-[10px] text-gray-400 uppercase font-bold">Member Keywords</p>
+                                                        {/* Cluster Filter Bridge — §5.5 */}
+                                                        <button
+                                                            onClick={() => {
+                                                                const ids = new Set<string>(
+                                                                    (cluster.keywords ?? []).map((k: any) => String(k.id))
+                                                                )
+                                                                setClusterKeywordFilter({ ids, clusterName: cluster.cluster_name })
+                                                                setActiveTab('keywords')
+                                                            }}
+                                                            className="flex items-center gap-1 text-[10px] font-semibold text-[#FF8903] hover:text-[#FEB107] transition-colors"
+                                                        >
+                                                            <Filter className="h-2.5 w-2.5" />
+                                                            View in Keywords
+                                                        </button>
+                                                    </div>
                                                     <div className="flex flex-col gap-1.5">
                                                         {(cluster.keywords ?? []).map((kw: any) => (
-                                                            <div key={kw.id} className="flex items-start justify-between gap-2 py-1.5 border-b border-gray-50 last:border-0">
-                                                                <div className="min-w-0">
+                                                            <div key={kw.id} className="flex items-start justify-between gap-2 py-1.5 border-b border-gray-50 last:border-0 group/kw">
+                                                                <div className="min-w-0 flex-1">
                                                                     <p className="text-xs font-medium text-gray-800 truncate">{kw.keyword}</p>
                                                                     {kw.sub_intent && (
                                                                         <p className="text-[10px] text-gray-400 italic truncate">{kw.sub_intent}</p>
                                                                     )}
                                                                 </div>
-                                                                {kw.intent_score != null && (
-                                                                    <span className="text-[10px] font-bold text-gray-500 shrink-0 bg-gray-50 px-1.5 py-0.5 rounded">
-                                                                        {kw.intent_score}
-                                                                    </span>
-                                                                )}
+                                                                <div className="flex items-center gap-1 shrink-0">
+                                                                    {kw.intent_score != null && (
+                                                                        <span className="text-[10px] font-bold text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded">
+                                                                            {kw.intent_score}
+                                                                        </span>
+                                                                    )}
+                                                                    {/* Move dropdown */}
+                                                                    <DropdownMenu>
+                                                                        <DropdownMenuTrigger asChild>
+                                                                            <button className="opacity-0 group-hover/kw:opacity-100 transition-opacity p-0.5 rounded hover:bg-gray-100" title="Move to another cluster">
+                                                                                <ArrowRightLeft className="h-3 w-3 text-gray-400" />
+                                                                            </button>
+                                                                        </DropdownMenuTrigger>
+                                                                        <DropdownMenuContent align="end" className="max-h-48 overflow-y-auto">
+                                                                            {(clusterResults?.clusters ?? []).filter((c: any) => c.id !== cluster.id).map((targetCluster: any) => (
+                                                                                <DropdownMenuItem
+                                                                                    key={targetCluster.id}
+                                                                                    onClick={async () => {
+                                                                                        try {
+                                                                                            const res = await fetch(`/api/datasets/${dataset.id}/clusters/move`, {
+                                                                                                method: 'POST',
+                                                                                                headers: { 'Content-Type': 'application/json' },
+                                                                                                body: JSON.stringify({ keyword_id: kw.id, from_cluster_id: cluster.id, to_cluster_id: targetCluster.id }),
+                                                                                            })
+                                                                                            if (res.ok) {
+                                                                                                toast.success(`Moved to "${targetCluster.cluster_name}"`);
+                                                                                                // Refresh cluster data
+                                                                                                const cRes = await fetch(`/api/datasets/${dataset.id}/clusters`)
+                                                                                                if (cRes.ok) setClusterResults(await cRes.json())
+                                                                                            } else {
+                                                                                                toast.error('Failed to move keyword')
+                                                                                            }
+                                                                                        } catch { toast.error('Failed to move keyword') }
+                                                                                    }}
+                                                                                    className="text-xs"
+                                                                                >
+                                                                                    {targetCluster.cluster_name}
+                                                                                </DropdownMenuItem>
+                                                                            ))}
+                                                                        </DropdownMenuContent>
+                                                                    </DropdownMenu>
+                                                                    {/* Remove button */}
+                                                                    <button
+                                                                        className="opacity-0 group-hover/kw:opacity-100 transition-opacity p-0.5 rounded hover:bg-red-50"
+                                                                        title="Remove from cluster"
+                                                                        onClick={async () => {
+                                                                            try {
+                                                                                const res = await fetch(`/api/datasets/${dataset.id}/clusters/remove`, {
+                                                                                    method: 'POST',
+                                                                                    headers: { 'Content-Type': 'application/json' },
+                                                                                    body: JSON.stringify({ keyword_id: kw.id, cluster_id: cluster.id }),
+                                                                                })
+                                                                                if (res.ok) {
+                                                                                    toast.success('Removed from cluster');
+                                                                                    const cRes = await fetch(`/api/datasets/${dataset.id}/clusters`)
+                                                                                    if (cRes.ok) setClusterResults(await cRes.json())
+                                                                                } else {
+                                                                                    toast.error('Failed to remove keyword')
+                                                                                }
+                                                                            } catch { toast.error('Failed to remove keyword') }
+                                                                        }}
+                                                                    >
+                                                                        <Trash2 className="h-3 w-3 text-red-400" />
+                                                                    </button>
+                                                                </div>
                                                             </div>
                                                         ))}
                                                     </div>

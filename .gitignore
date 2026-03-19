@@ -42,3 +42,11 @@ next-env.d.ts
 
 .vercel
 .env*.local
+
+# worker
+worker/node_modules
+worker/dist
+
+# test artifacts
+test-results
+playwright-report

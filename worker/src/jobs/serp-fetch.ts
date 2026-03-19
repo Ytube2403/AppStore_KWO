@@ -2,15 +2,14 @@
  * SERP Fetch Job Handler
  * job_type = 'serp_fetch'
  *
- * Fetches top-10 search results for each keyword from the correct store:
- *   - 'apple'       → app-store-scraper (.search)
- *   - 'google_play' → google-play-scraper (.search)
+ * Fetches top-10 search results for each keyword from the store:
+ *   ✅ 'google_play' → google-play-scraper (.search)
+ *   ⏸  'apple'       → temporarily disabled (rate limiting issues)
  *
  * The store is determined from the dataset record (datasets.store column).
  * Results are stored in serp_snapshots for use by the Clustering stage.
  */
 
-import store from 'app-store-scraper'
 import gplay from 'google-play-scraper'
 import { supabase } from '../lib/supabase'
 import { logger } from '../lib/logger'
@@ -18,9 +17,14 @@ import type { AnalysisJob } from '../types'
 
 type StoreType = 'apple' | 'google_play'
 
-const CONCURRENCY = 3      // parallel requests per batch (low to avoid Apple rate limits)
-const BATCH_DELAY_MS = 500 // ms between batches
+// Google Play: concurrency 3, delay 500ms — no significant rate limiting
+const CONCURRENCY = 3
+const BATCH_DELAY_MS = 500
 const MAX_RETRIES = 3
+
+// Apple App Store: temporarily disabled
+// const APPLE_CONCURRENCY = 1
+// const APPLE_DELAY_MS = 1500
 
 type SerpApp = {
     appId: string
@@ -35,34 +39,33 @@ function sleep(ms: number): Promise<void> {
     return new Promise(r => setTimeout(r, ms))
 }
 
-/** Fetch Apple App Store SERP via app-store-scraper */
-async function fetchAppleSerp(term: string, country: string): Promise<SerpApp[]> {
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            const results = await store.search({
-                term,
-                num: 10,
-                country: country || 'us',
-                lang: 'en-us',
-            }) as any[]
-            return results.map((app, idx) => ({
-                appId: String(app.appId || app.id || ''),
-                name: String(app.title || ''),
-                position: idx + 1,
-                score: app.score,
-                free: app.free,
-                developer: app.developer,
-            })).filter(a => a.appId)
-        } catch (err: any) {
-            // app-store-scraper often throws plain objects (not Error), so err.message may be undefined
-            const errStr = err?.message ?? (typeof err === 'object' ? JSON.stringify(err) : String(err))
-            logger.warn(`[serp] Apple attempt ${attempt}/${MAX_RETRIES} failed for "${term}": ${errStr}`)
-            if (attempt < MAX_RETRIES) await sleep(2000 * attempt)  // 2s, 4s — Apple rate limit
-        }
-    }
-    logger.error(`[serp] Apple SERP exhausted all retries for "${term}" — returning empty`)
-    return []
-}
+// ── Apple App Store SERP — Temporarily Disabled ─────────────────────────────
+//
+// Disabled due to rate limiting on iTunes Search API.
+// To re-enable: uncomment this function + update fetchSerp() below.
+//
+// async function fetchAppleSerp(term: string, country: string): Promise<SerpApp[]> {
+//     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+//         try {
+//             const storeLib = (await import('app-store-scraper')).default
+//             const results = await (storeLib as any).search({
+//                 term, num: 10, country: country || 'us', lang: 'en-us',
+//             }) as any[]
+//             return results.map((app, idx) => ({
+//                 appId: String(app.appId || app.id || ''),
+//                 name:  String(app.title || ''),
+//                 position: idx + 1,
+//                 score: app.score, free: app.free, developer: app.developer,
+//             })).filter(a => a.appId)
+//         } catch (err: any) {
+//             const errStr = err?.message ?? JSON.stringify(err)
+//             logger.warn(`[serp] Apple attempt ${attempt}/3 failed for "${term}": ${errStr}`)
+//             if (attempt < 3) await sleep(2000 * attempt)
+//         }
+//     }
+//     logger.error(`[serp] Apple exhausted all retries for "${term}" — returning empty`)
+//     return []
+// }
 
 /** Fetch Google Play SERP via google-play-scraper */
 async function fetchGplaySerp(term: string, country: string): Promise<SerpApp[]> {
@@ -94,9 +97,12 @@ async function fetchGplaySerp(term: string, country: string): Promise<SerpApp[]>
 
 /** Dispatch SERP fetch to the correct store scraper */
 async function fetchSerp(term: string, storeType: StoreType, country: string): Promise<SerpApp[]> {
-    return storeType === 'google_play'
-        ? fetchGplaySerp(term, country)
-        : fetchAppleSerp(term, country)
+    if (storeType === 'google_play') {
+        return fetchGplaySerp(term, country)
+    }
+    // Apple temporarily disabled
+    logger.warn(`[serp] Apple App Store is disabled. Skipping "${term}". Use a Google Play dataset.`)
+    return []
 }
 
 async function updateProgress(jobId: string, progressPercent: number) {

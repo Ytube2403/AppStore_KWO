@@ -18,7 +18,12 @@ const openrouter = new OpenAI({
   },
 })
 
-const MODEL = 'minimax/minimax-m2.5:free'
+const MODEL_FREE  = 'nvidia/nemotron-3-nano-30b-a3b:free'
+const MODEL_PREMIUM = 'nvidia/nemotron-3-nano-30b-a3b:free'
+
+function resolveModel(tier?: string): string {
+    return tier === 'premium' ? MODEL_PREMIUM : MODEL_FREE
+}
 
 // MiniMax M2.5 free — dùng concurrency thấp để an toàn
 const CHUNK_SIZE = 100        // keywords per call (giảm để đảm bảo JSON chính xác)
@@ -36,6 +41,7 @@ interface KeywordRow {
  */
 async function translateChunk(
   chunk: KeywordRow[],
+  model: string,
 ): Promise<{ id: string; keyword_en: string }[]> {
   const payload = chunk.map((kw) => ({ id: kw.id, keyword: kw.keyword }))
 
@@ -47,26 +53,44 @@ Return ONLY a valid JSON object matching this schema:
 Input Keywords:
 ${JSON.stringify(payload)}`
 
-  const response = await openrouter.chat.completions.create({
-    model: MODEL,
-    messages: [{ role: 'user', content: prompt }],
-    temperature: 0.1,
-    response_format: { type: 'json_object' },
-  })
+  let currentModel = model
+  const maxRetries = 2
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await openrouter.chat.completions.create({
+        model: currentModel,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+      })
 
-  const text = response.choices[0]?.message?.content
-  if (!text) return []
+      const text = response.choices[0]?.message?.content
+      if (!text) return []
 
-  try {
-    const parsed = JSON.parse(text)
-    if (!parsed || !Array.isArray(parsed.translations)) return []
-    return parsed.translations.filter(
-      (item: any) => item.id && typeof item.keyword_en === 'string',
-    ) as { id: string; keyword_en: string }[]
-  } catch {
-    logger.warn('Failed to parse LLM JSON response', { preview: text.slice(0, 200) })
-    return []
+      const parsed = JSON.parse(text)
+      if (!parsed || !Array.isArray(parsed.translations)) return []
+      return parsed.translations.filter(
+        (item: any) => item.id && typeof item.keyword_en === 'string',
+      ) as { id: string; keyword_en: string }[]
+    } catch (err: any) {
+      const status = err?.status ?? err?.response?.status ?? 0
+      const isRateLimit = status === 429 || String(err?.message).includes('429')
+      // Auto-fallback to premium on 429
+      if (isRateLimit && currentModel !== MODEL_PREMIUM) {
+        logger.warn(`[translation] Free model rate-limited (429) — falling back to premium: ${MODEL_PREMIUM}`)
+        currentModel = MODEL_PREMIUM
+        continue
+      }
+      if (attempt === 0 && isRateLimit) {
+        logger.warn(`[translation] Rate limit on premium model, retrying after delay...`)
+        await new Promise(r => setTimeout(r, 5000))
+        continue
+      }
+      logger.warn('Failed to call LLM for translation', { preview: err?.message?.slice?.(0, 200) })
+      return []
+    }
   }
+  return []
 }
 
 /**
@@ -91,8 +115,9 @@ async function saveTranslations(updates: { id: string; keyword_en: string }[]): 
 export async function handleTranslationJob(job: AnalysisJob): Promise<void> {
   const { dataset_id } = job
   const payload = job.payload as Partial<TranslationPayload>
+  const selectedModel = resolveModel((payload as any)?.model_tier)
 
-  logger.info('Starting translation job', { jobId: job.id, datasetId: dataset_id, model: MODEL })
+  logger.info('Starting translation job', { jobId: job.id, datasetId: dataset_id, model: selectedModel, tier: (payload as any)?.model_tier ?? 'free' })
 
   try {
     // 1. Fetch keywords chưa dịch
@@ -116,7 +141,7 @@ export async function handleTranslationJob(job: AnalysisJob): Promise<void> {
     }
 
     const total = keywords.length
-    logger.info(`Translating ${total} keywords via ${MODEL}`, { jobId: job.id })
+    logger.info(`Translating ${total} keywords via ${selectedModel}`, { jobId: job.id })
 
     // 2. Chia thành chunks
     const chunks: KeywordRow[][] = []
@@ -132,7 +157,7 @@ export async function handleTranslationJob(job: AnalysisJob): Promise<void> {
       const batchChunks = chunks.slice(i, i + CONCURRENCY)
 
       const batchResults = await Promise.allSettled(
-        batchChunks.map((chunk) => translateChunk(chunk)),
+        batchChunks.map((chunk) => translateChunk(chunk, selectedModel)),
       )
 
       for (const result of batchResults) {
