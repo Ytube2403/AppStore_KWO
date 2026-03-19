@@ -23,6 +23,7 @@ export default function ImportModal({ workspaceId }: { workspaceId: string }) {
     const [datasetName, setDatasetName] = useState('')
     const [market, setMarket] = useState('')
     const [concept, setConcept] = useState('')
+    const [store, setStore] = useState<'apple' | 'google_play'>('apple')
     const [headers, setHeaders] = useState<string[]>([])
     const [parsedData, setParsedData] = useState<any[]>([])
 
@@ -144,6 +145,7 @@ export default function ImportModal({ workspaceId }: { workspaceId: string }) {
                     name: datasetName,
                     market,
                     concept,
+                    store,
                     sourceFilename: file?.name,
                     columnMapping,
                     appMapping,
@@ -188,6 +190,46 @@ export default function ImportModal({ workspaceId }: { workspaceId: string }) {
 
                     {headers.length > 0 && (
                         <div className="space-y-4 animate-in fade-in">
+                            {/* Store picker */}
+                            <div className="flex items-center gap-3 bg-muted/30 border rounded-lg p-3 mb-2">
+                                <span className="text-sm font-medium text-gray-700 shrink-0">App Store</span>
+                                <div className="flex rounded-lg border overflow-hidden">
+                                    <button
+                                        type="button"
+                                        disabled={isProcessing}
+                                        onClick={() => setStore('apple')}
+                                        className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors ${
+                                            store === 'apple'
+                                                ? 'bg-gray-900 text-white'
+                                                : 'bg-white text-gray-600 hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        <svg viewBox="0 0 24 24" className="w-4 h-4 fill-current" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/>
+                                        </svg>
+                                        Apple
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={isProcessing}
+                                        onClick={() => setStore('google_play')}
+                                        className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors border-l ${
+                                            store === 'google_play'
+                                                ? 'bg-[#01875f] text-white'
+                                                : 'bg-white text-gray-600 hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        <svg viewBox="0 0 24 24" className="w-4 h-4 fill-current" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M3.18 23.76c.3.17.64.22.99.14l13.24-7.38-2.87-2.88-11.36 10.12zM.44 1.06C.17 1.4 0 1.89 0 2.53V21.5c0 .64.17 1.13.44 1.47l.08.07 10.62-10.62v-.24L.52.99.44 1.06zM20.49 10.33l-2.96-1.66-3.22 3.22 3.22 3.22 2.99-1.67c.85-.48.85-1.63-.03-2.11zm-19.31 13.43l13.24-7.38-2.87-2.88L.44 23.62c.3.17.64.22.74.14z"/>
+                                        </svg>
+                                        Google Play
+                                    </button>
+                                </div>
+                                <span className="text-xs text-muted-foreground">
+                                    {store === 'apple' ? 'SERP will be fetched from Apple App Store' : 'SERP will be fetched from Google Play'}
+                                </span>
+                            </div>
+
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
                                 <div className="grid gap-2">
                                     <Label>Dataset Name <span className="text-red-500">*</span></Label>

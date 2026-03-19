@@ -1,8 +1,10 @@
 import 'dotenv/config'
 import http from 'http'
-import { pickNextJob, recoverStalledJobs } from './lib/jobQueue'
+import { pickNextJob, recoverStalledJobs, markJobCompleted, markJobFailed } from './lib/jobQueue'
 import { handleTranslationJob } from './jobs/translation'
 import { handleSerpFetchJob } from './jobs/serp-fetch'
+import { handleIntentAnalysisJob } from './jobs/intent-analysis'
+import { handleClusteringJob } from './jobs/clustering'
 import { logger } from './lib/logger'
 import type { AnalysisJob } from './types'
 
@@ -56,13 +58,12 @@ async function dispatchJob(job: AnalysisJob): Promise<void> {
       await handleSerpFetchJob(job)
       break
 
-    // Sprint 3 handlers — registered here when implemented
     case 'intent_analysis':
-      logger.warn('intent_analysis handler not yet implemented — skipping', { jobId: job.id })
+      await handleIntentAnalysisJob(job)
       break
 
     case 'clustering':
-      logger.warn('clustering handler not yet implemented — skipping', { jobId: job.id })
+      await handleClusteringJob(job)
       break
 
     default:
@@ -82,11 +83,14 @@ async function pollOnce(): Promise<void> {
   isProcessing = true
   try {
     await dispatchJob(job)
+    // ✅ Mark job as completed after handler returns successfully
+    const processedCount = (job.payload as any)?.keyword_ids?.length ?? 0
+    await markJobCompleted(job.id, processedCount)
   } catch (err: any) {
-    logger.error('Unhandled error in job dispatch', {
-      jobId: job.id,
-      error: err?.message || String(err),
-    })
+    const msg = err?.message || String(err)
+    logger.error('Unhandled error in job dispatch', { jobId: job.id, error: msg })
+    // ✅ Mark job as failed so it surfaces in the UI and can be retried
+    await markJobFailed(job.id, msg)
   } finally {
     isProcessing = false
   }

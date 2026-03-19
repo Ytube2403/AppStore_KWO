@@ -1,9 +1,10 @@
 import { createClient } from '@/utils/supabase/server'
 import { NextRequest, NextResponse } from 'next/server'
-import { scrapeAppInfo, parseStoreUrl } from '@/lib/app-store-scraper'
+import { scrapeAppInfo, parseStoreUrl } from '@/lib/store-scraper'
 import { GoogleGenAI } from '@google/genai'
 
-const geminiModel = 'gemini-2.0-flash'
+// Use stable model — not preview/experimental which may be unavailable or deprecated
+const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
 
 export type AppProfile = {
     title: string
@@ -72,10 +73,14 @@ export async function POST(
         .maybeSingle()
 
     if (cached?.semantic_profile) {
-        // Cache hit — save to dataset and return immediately
+        // Cache hit — save profile + store + country to dataset and return immediately
         await supabase
             .from('datasets')
-            .update({ target_app_profile: cached.semantic_profile })
+            .update({
+                target_app_profile: cached.semantic_profile,
+                store,           // 'apple' | 'google_play' — needed by serp-fetch worker
+                country_code: country,
+            })
             .eq('id', datasetId)
 
         return NextResponse.json({
@@ -143,7 +148,11 @@ Return ONLY valid JSON (no markdown):
     // ── Save to dataset ───────────────────────────────────────────────────────
     await supabase
         .from('datasets')
-        .update({ target_app_profile: profile })
+        .update({
+            target_app_profile: profile,
+            store,           // 'apple' | 'google_play' — used by serp-fetch worker to pick correct scraper
+            country_code: country,
+        })
         .eq('id', datasetId)
 
     return NextResponse.json({

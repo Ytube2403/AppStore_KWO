@@ -3,10 +3,20 @@ import { NextRequest, NextResponse } from 'next/server'
 
 /**
  * POST /api/datasets/[datasetId]/analyze
- * Creates an analysis run + enqueues a `serp_fetch` job for the Worker.
+ * Creates an analysis run + enqueues 3 sequential Worker jobs:
+ *   1. serp_fetch      (priority 5) — fetch store SERP for each keyword
+ *   2. intent_analysis (priority 6) — classify intent via LLM
+ *   3. clustering      (priority 7) — group keywords into clusters
+ *
+ * Ordering rationale:
+ *   - serpJob is created FIRST so its UUID can be used as the FK
+ *     `intent_analysis_runs.job_id` (NOT NULL REFERENCES analysis_jobs.id).
+ *   - run is created after serpJob, before intent/cluster jobs, so run_id
+ *     is fully available in all subsequent job payloads — no race condition.
+ *   - No separate "patch run_id" step needed.
  *
  * Body: { keywordIds: string[] }
- * Returns: { jobId, runId, async: true }
+ * Returns: { serpJobId, intentJobId, clusterJobId, runId, async: true }
  */
 export async function POST(
     req: NextRequest,
@@ -14,13 +24,11 @@ export async function POST(
 ) {
     const supabase = await createClient()
 
-    // Auth check
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
     const { datasetId } = await params
 
-    // Parse body
     let keywordIds: string[]
     try {
         const body = await req.json()
@@ -28,11 +36,16 @@ export async function POST(
         if (!Array.isArray(keywordIds) || keywordIds.length === 0) {
             return NextResponse.json({ error: 'keywordIds must be a non-empty array' }, { status: 400 })
         }
+        // Validate UUID format to prevent injection / bad data
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+        if (!keywordIds.every(id => UUID_RE.test(id))) {
+            return NextResponse.json({ error: 'All keywordIds must be valid UUIDs' }, { status: 400 })
+        }
     } catch {
         return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
     }
 
-    // Verify dataset exists & has a target_app_profile
+    // Verify dataset exists & user has access, and has a target_app_profile
     const { data: dataset, error: dsErr } = await supabase
         .from('datasets')
         .select('id, workspace_id, target_app_profile')
@@ -49,15 +62,63 @@ export async function POST(
         }, { status: 400 })
     }
 
-    // Cap at 500 keywords (hard cap from SPEC v5)
-    const capped = keywordIds.slice(0, 500)
+    // Verify keyword IDs actually belong to this dataset (prevent cross-dataset access)
+    const { data: validKeywords, error: kwValErr } = await supabase
+        .from('keywords')
+        .select('id')
+        .eq('dataset_id', datasetId)
+        .in('id', keywordIds.slice(0, 500))
 
-    // 1. Create intent_analysis_run record
+    if (kwValErr) {
+        return NextResponse.json({ error: 'Failed to validate keywords' }, { status: 500 })
+    }
+
+    const validIds = (validKeywords || []).map((k: { id: string }) => k.id)
+    if (validIds.length === 0) {
+        return NextResponse.json({ error: 'No valid keywords found for this dataset' }, { status: 400 })
+    }
+
+    // Hard cap at 500 keywords (use only validated IDs)
+    const capped = validIds.slice(0, 500)
+    const workspaceId = dataset.workspace_id
+
+    const commonJobFields = {
+        workspace_id: workspaceId,
+        dataset_id: datasetId,
+        status: 'pending',
+        progress_percent: 0,
+        retry_count: 0,
+        max_retries: 3,
+    }
+
+    // ── 1. Enqueue serp_fetch FIRST (priority 5) ──────────────────────────────
+    // serpJob.id is needed as FK for intent_analysis_runs.job_id.
+    // run_id is not yet known here — patched below after run is created.
+    const { data: serpJob, error: serpErr } = await supabase
+        .from('analysis_jobs')
+        .insert({
+            ...commonJobFields,
+            job_type: 'serp_fetch',
+            priority: 5,
+            // run_id will be patched in step 3; worker will not start until priority ordering
+            payload: { keyword_ids: capped, dataset_id: datasetId },
+        })
+        .select('id')
+        .single()
+
+    if (serpErr || !serpJob) {
+        return NextResponse.json({ error: `Failed to enqueue serp_fetch: ${serpErr?.message}` }, { status: 500 })
+    }
+
+    // ── 2. Create intent_analysis_run with serpJob.id as FK ───────────────────
+    // run is created after serpJob exists to satisfy the NOT NULL FK constraint.
     const { data: run, error: runErr } = await supabase
         .from('intent_analysis_runs')
         .insert({
             dataset_id: datasetId,
-            status: 'pending',
+            workspace_id: workspaceId,
+            job_id: serpJob.id,   // valid FK reference — no placeholder needed
+            status: 'running',
             total_keywords: capped.length,
             processed_keywords: 0,
         })
@@ -65,43 +126,62 @@ export async function POST(
         .single()
 
     if (runErr || !run) {
+        await supabase.from('analysis_jobs').delete().eq('id', serpJob.id)
         return NextResponse.json({ error: `Failed to create analysis run: ${runErr?.message}` }, { status: 500 })
     }
 
-    // 2. Enqueue serp_fetch job
-    const { data: job, error: jobErr } = await supabase
+    const runId = run.id
+
+    // ── 3. Patch run_id into serpJob payload ──────────────────────────────────
+    // This is the only patch needed — serpJob was created before run existed.
+    // intentJob and clusterJob (steps 4-5) already have run_id from the start.
+    await supabase
+        .from('analysis_jobs')
+        .update({ payload: { keyword_ids: capped, run_id: runId, dataset_id: datasetId } })
+        .eq('id', serpJob.id)
+
+    // ── 4. Enqueue intent_analysis job (priority 6) with run_id ──────────────
+    const { data: intentJob, error: intentErr } = await supabase
         .from('analysis_jobs')
         .insert({
-            workspace_id: dataset.workspace_id,
-            dataset_id: datasetId,
-            job_type: 'serp_fetch',
-            status: 'pending',
-            progress_percent: 0,
-            payload: {
-                keyword_ids: capped,
-                run_id: run.id,
-            },
-            retry_count: 0,
-            max_retries: 3,
+            ...commonJobFields,
+            job_type: 'intent_analysis',
+            priority: 6,
+            payload: { keyword_ids: capped, run_id: runId, dataset_id: datasetId },
         })
         .select('id')
         .single()
 
-    if (jobErr || !job) {
-        // Cleanup the orphaned run
-        await supabase.from('intent_analysis_runs').delete().eq('id', run.id)
-        return NextResponse.json({ error: `Failed to enqueue job: ${jobErr?.message}` }, { status: 500 })
+    if (intentErr || !intentJob) {
+        await supabase.from('analysis_jobs').delete().eq('id', serpJob.id)
+        await supabase.from('intent_analysis_runs').delete().eq('id', runId)
+        return NextResponse.json({ error: `Failed to enqueue intent_analysis: ${intentErr?.message}` }, { status: 500 })
     }
 
-    // 3. Link job back to run
-    await supabase
-        .from('intent_analysis_runs')
-        .update({ job_id: job.id })
-        .eq('id', run.id)
+    // ── 5. Enqueue clustering job (priority 7) with run_id ───────────────────
+    const { data: clusterJob, error: clusterErr } = await supabase
+        .from('analysis_jobs')
+        .insert({
+            ...commonJobFields,
+            job_type: 'clustering',
+            priority: 7,
+            payload: { run_id: runId, dataset_id: datasetId },
+        })
+        .select('id')
+        .single()
+
+    if (clusterErr || !clusterJob) {
+        await supabase.from('analysis_jobs').delete().eq('id', serpJob.id)
+        await supabase.from('analysis_jobs').delete().eq('id', intentJob.id)
+        await supabase.from('intent_analysis_runs').delete().eq('id', runId)
+        return NextResponse.json({ error: `Failed to enqueue clustering: ${clusterErr?.message}` }, { status: 500 })
+    }
 
     return NextResponse.json({
-        jobId: job.id,
-        runId: run.id,
+        serpJobId: serpJob.id,
+        intentJobId: intentJob.id,
+        clusterJobId: clusterJob.id,
+        runId,
         keywordCount: capped.length,
         async: true,
     })

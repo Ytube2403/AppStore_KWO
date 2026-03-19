@@ -13,6 +13,9 @@ export type AppInfo = {
     country: string
 }
 
+/** Store type matching DB CHECK constraint on datasets.store */
+export type DbStoreType = 'apple' | 'google_play'
+
 /** Parse App Store ID & country from URL */
 function parseAppStoreUrl(url: string): { appId: string; country: string } | null {
     // https://apps.apple.com/us/app/name/id123456789
@@ -138,12 +141,13 @@ export async function scrapeAppInfo(url: string): Promise<AppInfo> {
 
 /**
  * Extract a canonical App Store / Play ID + store + country from any URL.
+ * Returns store as DbStoreType ('apple' | 'google_play') matching datasets.store CHECK constraint.
  * Returns null if URL is not recognized.
  */
-export function parseStoreUrl(url: string): { appId: string; store: 'appstore' | 'googleplay'; country: string } | null {
+export function parseStoreUrl(url: string): { appId: string; store: DbStoreType; country: string } | null {
     const apple = parseAppStoreUrl(url)
-    if (apple) return { ...apple, store: 'appstore' }
+    if (apple) return { ...apple, store: 'apple' }
     const play = parseGooglePlayUrl(url)
-    if (play) return { ...play, store: 'googleplay' }
+    if (play) return { ...play, store: 'google_play' }
     return null
 }

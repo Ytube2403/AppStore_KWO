@@ -5,19 +5,22 @@
   "private": true,
   "main": "dist/index.js",
   "scripts": {
-    "dev": "ts-node --esm src/index.ts",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
+    "app-store-scraper": "^0.18.0",
     "dotenv": "^16.4.5",
+    "google-play-scraper": "^10.1.2",
     "openai": "^4.104.0"
   },
   "devDependencies": {
     "@types/node": "^20",
     "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
     "typescript": "^5"
   }
 }

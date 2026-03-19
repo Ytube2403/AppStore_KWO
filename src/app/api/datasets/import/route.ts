@@ -17,6 +17,7 @@ export async function POST(request: Request) {
             name,
             market,
             concept,
+            store,          // 'apple' | 'google_play'
             sourceFilename,
             columnMapping,
             appMapping, // { myApp: '', competitors: [] }
@@ -35,6 +36,7 @@ export async function POST(request: Request) {
                 name,
                 market,
                 concept,
+                store: store === 'google_play' ? 'google_play' : 'apple',
                 source_filename: sourceFilename,
                 competitor_count: appMapping.competitors?.length || 0,
                 // store which app is 'mine'
