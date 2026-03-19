@@ -1,0 +1,25 @@
+{
+  "functions": {
+    "src/app/api/datasets/[datasetId]/recompute/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/datasets/[datasetId]/clusters/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/datasets/[datasetId]/analyze/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/datasets/[datasetId]/generate-profile/route.ts": {
+      "maxDuration": 120
+    },
+    "src/app/api/datasets/[datasetId]/translate/route.ts": {
+      "maxDuration": 120
+    },
+    "src/app/api/datasets/[datasetId]/update/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/datasets/import/route.ts": {
+      "maxDuration": 120
+    }
+  }
+}
