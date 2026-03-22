@@ -1,0 +1,14 @@
+# GitHub Linguist overrides
+# Exclude generated/vendor files from language stats
+
+# Test reports & artifacts
+playwright-report/** linguist-generated=true
+test-results/** linguist-generated=true
+
+# Public static assets
+public/** linguist-vendored=true
+
+# Config files - not counted as code
+*.config.js linguist-documentation=true
+*.config.ts linguist-documentation=true
+components.json linguist-documentation=true
